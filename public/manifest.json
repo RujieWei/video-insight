@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Video Insight",
+  "description": "用于学习 YouTube 英文长视频的 Chrome Side Panel 插件。",
+  "version": "0.1.0",
+  "action": {
+    "default_title": "Video Insight"
+  },
+  "permissions": ["sidePanel", "tabs", "storage"],
+  "host_permissions": ["https://www.youtube.com/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "side_panel": {
+    "default_path": "index.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.youtube.com/*"],
+      "js": ["content.js"]
+    }
+  ]
+}
