@@ -930,7 +930,7 @@ function App() {
       return false;
     }
 
-    setAuthMessage("验证码已发送，请在邮箱里查看 6 位数字验证码。");
+    setAuthMessage("验证码已发送，请在邮箱里查看 8 位数字验证码。");
     return true;
   }
 
@@ -1182,15 +1182,15 @@ function CloudAuthPanel({
             <input
               className="min-w-0 flex-1 rounded-md border border-[#dfe4dc] bg-[#fbfcf8] px-3 py-2 text-sm outline-none focus:border-[#4f6b4a]"
               inputMode="numeric"
-              maxLength={6}
-              placeholder="输入 6 位验证码"
-              value={otpToken}
-              onChange={(event) => setOtpToken(event.target.value.replace(/\D/g, "").slice(0, 6))}
-            />
+            maxLength={8}
+            placeholder="输入 8 位验证码"
+            value={otpToken}
+            onChange={(event) => setOtpToken(event.target.value.replace(/\D/g, "").slice(0, 8))}
+          />
             <button
               type="button"
               className="shrink-0 rounded-md border border-[#20241f] px-3 py-2 text-sm font-semibold text-[#20241f] disabled:cursor-not-allowed disabled:border-[#c4cabc] disabled:text-[#9aa392]"
-              disabled={isLoading || otpToken.trim().length !== 6}
+              disabled={isLoading || otpToken.trim().length !== 8}
               onClick={handleVerifyOtp}
             >
               验证登录
