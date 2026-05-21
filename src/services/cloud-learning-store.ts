@@ -1,4 +1,5 @@
 import { mockOverview } from "../mock/learning-data";
+import type { LearningOverview } from "../types/learning";
 import { isSupabaseConfigured, supabase } from "./supabase";
 
 export type CloudVideoInfo = {
@@ -34,13 +35,18 @@ export type CloudVocabularyItem = {
   meaningZh: string;
   sourceSentence: string;
   sourceTranslation: string;
-  example: {
+  example?: {
     en: string;
     zh: string;
   };
+  generatedExamples?: Array<{
+    en: string;
+    zh: string;
+  }>;
 };
 
 export type CloudLearningState = {
+  overview?: LearningOverview | null;
   chatItems: CloudChatItem[];
   noteItems: CloudNoteItem[];
   vocabularyItems: CloudVocabularyItem[];
@@ -154,19 +160,21 @@ async function upsertVideoRecord(videoInfo: CloudVideoInfo) {
   return data.id;
 }
 
-async function upsertVideoAnalysis(videoDbId: string) {
+async function upsertVideoAnalysis(videoDbId: string, overview: LearningOverview | null | undefined) {
   const client = getClient();
 
   if (!client) {
     return;
   }
 
+  const analysisOverview = overview ?? mockOverview;
+
   const { error } = await client.from("video_analyses").upsert(
     {
       video_id: videoDbId,
       status: "completed",
-      summary: mockOverview.summary,
-      mindmap_mermaid: mockOverview.mindmapMermaid,
+      summary: analysisOverview.summary,
+      mindmap_mermaid: analysisOverview.mindmapMermaid,
       language: "en",
       is_partial: false
     },
@@ -274,7 +282,7 @@ async function upsertVocabularyItems(
           text: item.text,
           type: item.type,
           meaning_zh: item.meaningZh,
-          examples: [item.example]
+          examples: item.generatedExamples ?? (item.example ? [item.example] : [])
         },
         { onConflict: "user_id,text,type" }
       )
@@ -314,7 +322,7 @@ export async function saveCloudLearningState(
     return;
   }
 
-  await upsertVideoAnalysis(videoDbId);
+  await upsertVideoAnalysis(videoDbId, learningState.overview);
   await upsertChatItems(userId, videoDbId, learningState.chatItems);
   await upsertNotes(userId, videoDbId, learningState.noteItems);
   await upsertVocabularyItems(userId, videoDbId, learningState.vocabularyItems);
@@ -413,7 +421,7 @@ export async function loadCloudLearningState(
         meaningZh: item.meaning_zh ?? "",
         sourceSentence: source.source_sentence ?? "",
         sourceTranslation: source.source_translation ?? "",
-        example: firstExample
+        generatedExamples: item.examples ?? (firstExample.en ? [firstExample] : [])
       }];
     });
 

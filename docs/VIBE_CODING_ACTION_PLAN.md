@@ -529,9 +529,10 @@ AI JSON 输出必须校验，失败时展示“生成失败”。
 
 ### 要做
 
-- 由 Edge Function 或后端能力获取 YouTube 英文字幕。
-- 只支持可获取英文字幕的视频。
-- 无英文字幕时展示 `当前视频无法解析`。
+- 通过 Edge Function 中的 `CaptionProvider` 获取 YouTube 英文字幕正文。
+- 首个实现使用 Supadata `native` 模式，只获取已有英文字幕，不做 AI 转写。
+- 只支持可获取英文字幕正文的视频。
+- 无法获取英文字幕正文时展示 `当前视频无法解析`。
 - 真实字幕进入 ModelProvider 做重切分和翻译。
 - 解析结果保存到 Supabase。
 
@@ -546,15 +547,18 @@ AI JSON 输出必须校验，失败时展示“生成失败”。
 ```text
 请只执行 Phase 11：接入真实 YouTube 英文字幕获取。
 开始前先阅读 docs/YOUTUBE_CAPTION_FEASIBILITY.md 和 docs/TECH_ARCHITECTURE.md。
-只支持可获取英文字幕的视频。
-无英文字幕时展示“当前视频无法解析”。
+使用 Edge Function 中的 CaptionProvider 获取英文字幕正文，首个 provider 使用 Supadata native。
+只支持可获取英文字幕正文的视频。
+无英文字幕正文时展示“当前视频无法解析”。
 不要做语音转写，不支持非英文视频，不支持超过 60 分钟视频。
 ```
 
 ### 完成标准
 
-- 有英文字幕的 YouTube 短视频能完成真实解析。
-- 无英文字幕视频展示明确不可解析提示。
+- 成功标准是拿到可用字幕正文片段，不是检测到字幕轨道或字幕字段。
+- Supadata native 对指定验证视频返回 `segments.length > 0`，且至少一条字幕 `text` 非空、有有效 `startTime`。
+- 成功获取英文字幕正文的 YouTube 短视频能完成真实解析。
+- 无法获取英文字幕正文的视频展示明确不可解析提示。
 - 解析后进入真实学习态。
 
 ### 手动验收

@@ -85,14 +85,14 @@ AI 模型调用通过 ModelProvider 抽象层实现。
 - generateOverview
 - answerQuestion
 - organizeNote
-- extractVocabularyCandidates
-- generateVocabularyDetails
+- generateVocabularyItem
+- generateVocabularyExamples
 
 可选实现：
 - MockModelProvider
+- DeepSeekProvider
 - OpenAIProvider
 - QwenProvider
-- ClaudeProvider
 
 ## 6. SearchProvider
 
@@ -111,14 +111,20 @@ AI 模型调用通过 ModelProvider 抽象层实现。
 
 ## 7. 字幕获取
 
-Phase 0 / Phase 1 使用 mock 字幕。
+Phase 0-10 使用 mock 字幕。
 
-后续真实字幕获取由 Backend API 实现。
+Phase 11 使用 Supabase Edge Function 中的 `CaptionProvider` 获取英文字幕正文。
+
+首个实现为 `SupadataCaptionProvider`，使用 Supadata `native` 模式，只读取视频已有英文字幕，不做 AI 语音转写。Supadata API Key 只能放在 Edge Function secrets 中，前端不能接触。
+
+页面内 YouTube 字幕读取只作为实验性 fallback，不作为 MVP 主链路。
 
 MVP 只支持可获取英文字幕的视频。
 
-如果无法获取英文字幕，返回错误：
-“当前视频未检测到可用英文字幕，MVP 暂不支持无字幕视频或非英文视频解析。”
+如果无法获取英文字幕正文，返回错误：
+“当前视频无法解析：没有成功获取英文字幕正文。”
+
+成功标准必须是拿到可用字幕正文片段，不能把“检测到字幕轨道”“有字幕字段”或“有语言列表”当成成功。
 
 MVP 不支持无字幕视频语音转写。
 

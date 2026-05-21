@@ -6,7 +6,7 @@
   "action": {
     "default_title": "Video Insight"
   },
-  "permissions": ["sidePanel", "tabs", "storage"],
+  "permissions": ["sidePanel", "tabs", "storage", "scripting"],
   "host_permissions": ["https://www.youtube.com/*"],
   "background": {
     "service_worker": "background.js"

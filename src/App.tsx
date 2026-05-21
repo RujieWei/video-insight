@@ -1,11 +1,25 @@
 import * as React from "react";
 import { mockOverview, mockSubtitleSegments } from "./mock/learning-data";
+import {
+  answerQuestionWithAi,
+  fetchTranscriptWithCaptionProvider,
+  generateVocabularyExamplesWithAi,
+  generateVocabularyItemWithAi,
+  generateOverviewForLongVideo,
+  organizeNoteWithAi,
+  prepareSubtitleTranslationBatches,
+  translateSubtitleBatch,
+  type SubtitleTranslationBatch
+} from "./services/ai-tasks";
 import { loadCloudLearningState, saveCloudLearningState } from "./services/cloud-learning-store";
 import {
   isSupabaseConfigured,
   supabase,
   type SupabaseUser
 } from "./services/supabase";
+import type { LearningOverview, SubtitleSegment } from "./types/learning";
+import { isRetriableAiTaskError } from "./utils/ai-errors";
+import { formatDuration } from "./utils/time";
 
 type VideoInfo = {
   isYouTubeVideoPage: boolean;
@@ -40,14 +54,14 @@ type LearningTab = {
 };
 
 type CloudSyncStatus = "idle" | "syncing" | "synced" | "error";
+type GenerationSource = "mock" | "ai" | "failed";
+type ChatSource = "mock" | "ai" | "failed" | "loading";
 
 type PlaybackTimePayload = {
   videoId: string;
   currentTime: number;
   collectedAt: number;
 };
-
-type SubtitleSegment = (typeof mockSubtitleSegments)[number];
 
 type SelectedSubtitle = {
   text: string;
@@ -60,6 +74,7 @@ type MockChatItem = {
   id: string;
   question: string;
   answer: string;
+  source?: ChatSource;
 };
 
 type MockNoteItem = {
@@ -71,6 +86,8 @@ type MockNoteItem = {
   startTime: number;
   endTime: number;
   isSaved: boolean;
+  aiOrganizeFailed?: boolean;
+  aiOrganizing?: boolean;
 };
 
 type MockVocabularyItem = {
@@ -80,14 +97,25 @@ type MockVocabularyItem = {
   meaningZh: string;
   sourceSentence: string;
   sourceTranslation: string;
-  example: {
+  example?: {
     en: string;
     zh: string;
   };
+  generatedExamples?: Array<{
+    en: string;
+    zh: string;
+  }>;
+  examplesGenerating?: boolean;
+  examplesGenerationFailed?: boolean;
 };
 
 type StoredLearningState = {
   parsed: true;
+  overview?: LearningOverview | null;
+  subtitleSegments?: SubtitleSegment[];
+  overviewSource?: GenerationSource;
+  subtitleSource?: GenerationSource;
+  overviewGenerationFailed?: boolean;
   chatItems: MockChatItem[];
   noteItems: MockNoteItem[];
   vocabularyItems: MockVocabularyItem[];
@@ -98,6 +126,7 @@ const VIDEO_INFO_REQUEST = "VIDEO_INSIGHT_GET_VIDEO_INFO";
 const VIDEO_INFO_UPDATED = "VIDEO_INSIGHT_VIDEO_INFO_UPDATED";
 const PLAYBACK_TIME_UPDATED = "VIDEO_INSIGHT_PLAYBACK_TIME_UPDATED";
 const SEEK_TO_TIME = "VIDEO_INSIGHT_SEEK_TO_TIME";
+const ENGLISH_CAPTIONS_REQUEST = "VIDEO_INSIGHT_GET_ENGLISH_CAPTIONS";
 const STORAGE_KEY_PREFIX = "video-insight:learning:";
 
 const MOCK_PARSE_STEPS: ParseStep[] = [
@@ -125,6 +154,30 @@ function createInitialParseStepStatuses() {
   }, {});
 }
 
+type RawCaptionSegment = {
+  startTime: number;
+  endTime: number;
+  text: string;
+};
+
+type EnglishCaptionsResult =
+  | {
+      ok: true;
+      payload: {
+        track: {
+          languageCode: string;
+          name: string;
+          kind: string;
+        };
+        segments: RawCaptionSegment[];
+      };
+    }
+  | {
+      ok: false;
+      errorCode: string;
+      message: string;
+    };
+
 function createCompletedParseStepStatuses() {
   return MOCK_PARSE_STEPS.reduce<Record<string, ParseStepStatus>>((statuses, step) => {
     statuses[step.key] = "completed";
@@ -145,6 +198,11 @@ function normalizeStoredLearningState(value: unknown): StoredLearningState | nul
 
   return {
     parsed: true,
+    overview: maybeState.overview ?? undefined,
+    subtitleSegments: Array.isArray(maybeState.subtitleSegments) ? maybeState.subtitleSegments : undefined,
+    overviewSource: maybeState.overviewSource,
+    subtitleSource: maybeState.subtitleSource,
+    overviewGenerationFailed: Boolean(maybeState.overviewGenerationFailed),
     chatItems: Array.isArray(maybeState.chatItems) ? maybeState.chatItems : [],
     noteItems: Array.isArray(maybeState.noteItems) ? maybeState.noteItems : [],
     vocabularyItems: Array.isArray(maybeState.vocabularyItems) ? maybeState.vocabularyItems : [],
@@ -173,22 +231,6 @@ function saveStoredLearningState(videoId: string, state: StoredLearningState) {
       resolve();
     });
   });
-}
-
-function formatDuration(durationSeconds: number | null) {
-  if (durationSeconds === null) {
-    return "读取中";
-  }
-
-  const hours = Math.floor(durationSeconds / 3600);
-  const minutes = Math.floor((durationSeconds % 3600) / 60);
-  const seconds = durationSeconds % 60;
-
-  if (hours > 0) {
-    return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
-  }
-
-  return `${minutes}:${String(seconds).padStart(2, "0")}`;
 }
 
 function isYouTubeUrl(url?: string) {
@@ -233,6 +275,528 @@ function seekActiveTabToTime(tabId: number, timeSeconds: number) {
     type: SEEK_TO_TIME,
     payload: { timeSeconds }
   }) as Promise<{ ok: boolean }>;
+}
+
+async function requestEnglishCaptionsFromPageWorld(tabId: number): Promise<EnglishCaptionsResult> {
+  const executionResults = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: async () => {
+      function extractJsonObjectAfterMarker(source: string, marker: string) {
+        const markerIndex = source.indexOf(marker);
+
+        if (markerIndex < 0) {
+          return null;
+        }
+
+        const startIndex = source.indexOf("{", markerIndex);
+
+        if (startIndex < 0) {
+          return null;
+        }
+
+        let depth = 0;
+        let inString = false;
+        let isEscaped = false;
+
+        for (let index = startIndex; index < source.length; index += 1) {
+          const char = source[index];
+
+          if (inString) {
+            if (isEscaped) {
+              isEscaped = false;
+            } else if (char === "\\") {
+              isEscaped = true;
+            } else if (char === "\"") {
+              inString = false;
+            }
+
+            continue;
+          }
+
+          if (char === "\"") {
+            inString = true;
+            continue;
+          }
+
+          if (char === "{") {
+            depth += 1;
+          } else if (char === "}") {
+            depth -= 1;
+
+            if (depth === 0) {
+              return source.slice(startIndex, index + 1);
+            }
+          }
+        }
+
+        return null;
+      }
+
+      function parseInitialPlayerResponseFromText(text: string) {
+        if (!text.includes("ytInitialPlayerResponse")) {
+          return null;
+        }
+
+        const jsonText = extractJsonObjectAfterMarker(text, "ytInitialPlayerResponse");
+
+        if (!jsonText) {
+          return null;
+        }
+
+        try {
+          return JSON.parse(jsonText);
+        } catch {
+          return null;
+        }
+      }
+
+      function findObjectWithKey(value: unknown, targetKey: string): Record<string, unknown> | null {
+        if (!value || typeof value !== "object") {
+          return null;
+        }
+
+        if (Object.prototype.hasOwnProperty.call(value, targetKey)) {
+          return value as Record<string, unknown>;
+        }
+
+        if (Array.isArray(value)) {
+          for (const item of value) {
+            const result = findObjectWithKey(item, targetKey);
+
+            if (result) {
+              return result;
+            }
+          }
+
+          return null;
+        }
+
+        for (const child of Object.values(value)) {
+          const result = findObjectWithKey(child, targetKey);
+
+          if (result) {
+            return result;
+          }
+        }
+
+        return null;
+      }
+
+      function parseInitialDataFromText(text: string) {
+        if (!text.includes("ytInitialData")) {
+          return null;
+        }
+
+        const jsonText = extractJsonObjectAfterMarker(text, "ytInitialData");
+
+        if (!jsonText) {
+          return null;
+        }
+
+        try {
+          return JSON.parse(jsonText);
+        } catch {
+          return null;
+        }
+      }
+
+      function readInitialData() {
+        const pageWindow = window as typeof window & {
+          ytInitialData?: unknown;
+        };
+
+        if (pageWindow.ytInitialData) {
+          return pageWindow.ytInitialData;
+        }
+
+        for (const script of Array.from(document.scripts)) {
+          const initialData = parseInitialDataFromText(script.textContent || "");
+
+          if (initialData) {
+            return initialData;
+          }
+        }
+
+        return null;
+      }
+
+      function readYtcfgValue(key: string) {
+        const pageWindow = window as typeof window & {
+          ytcfg?: {
+            get?: (key: string) => unknown;
+          };
+        };
+
+        if (typeof pageWindow.ytcfg?.get === "function") {
+          const value = pageWindow.ytcfg.get(key);
+
+          if (value) {
+            return value;
+          }
+        }
+
+        for (const script of Array.from(document.scripts)) {
+          const text = script.textContent || "";
+
+          if (!text.includes("ytcfg.set") || !text.includes(key)) {
+            continue;
+          }
+
+          const jsonText = extractJsonObjectAfterMarker(text, "ytcfg.set");
+
+          if (!jsonText) {
+            continue;
+          }
+
+          try {
+            const config = JSON.parse(jsonText) as Record<string, unknown>;
+            const value = config[key];
+
+            if (value) {
+              return value;
+            }
+          } catch {
+            continue;
+          }
+        }
+
+        return null;
+      }
+
+      function readPlayerResponseFromPlayerElement() {
+        const player = document.querySelector("#movie_player") as
+          | (Element & { getPlayerResponse?: () => unknown })
+          | null;
+
+        if (typeof player?.getPlayerResponse !== "function") {
+          return null;
+        }
+
+        try {
+          return player.getPlayerResponse();
+        } catch {
+          return null;
+        }
+      }
+
+      async function readPlayerResponse() {
+        const pageWindow = window as typeof window & {
+          ytInitialPlayerResponse?: unknown;
+        };
+        const currentPlayerResponse =
+          readPlayerResponseFromPlayerElement() || pageWindow.ytInitialPlayerResponse;
+
+        if (currentPlayerResponse) {
+          return currentPlayerResponse;
+        }
+
+        for (const script of Array.from(document.scripts)) {
+          const scriptPlayerResponse = parseInitialPlayerResponseFromText(script.textContent || "");
+
+          if (scriptPlayerResponse) {
+            return scriptPlayerResponse;
+          }
+        }
+
+        const watchUrl = new URL(window.location.href);
+        watchUrl.searchParams.set("hl", "en");
+
+        const response = await fetch(watchUrl.toString(), {
+          credentials: "include"
+        });
+
+        if (!response.ok) {
+          return null;
+        }
+
+        return parseInitialPlayerResponseFromText(await response.text());
+      }
+
+      type PageCaptionTrack = {
+        baseUrl?: string;
+        languageCode?: string;
+        kind?: string;
+        name?: {
+          simpleText?: string;
+          runs?: Array<{ text?: string }>;
+        };
+      };
+
+      function chooseEnglishCaptionTrack(captionTracks: PageCaptionTrack[]) {
+        const englishTracks = captionTracks.filter((track) => {
+          const languageCode = String(track.languageCode || "").toLowerCase();
+          return languageCode === "en" || languageCode.startsWith("en-");
+        });
+
+        if (englishTracks.length === 0) {
+          return null;
+        }
+
+        return englishTracks.find((track) => track.kind !== "asr") || englishTracks[0];
+      }
+
+      function normalizeCaptionText(text: string) {
+        return text
+          .replace(/\s+/g, " ")
+          .replace(/&amp;/g, "&")
+          .replace(/&quot;/g, "\"")
+          .replace(/&#39;/g, "'")
+          .trim();
+      }
+
+      function parseTranscriptSegments(value: unknown) {
+        const segments: Array<{ startTime: number; endTime: number; text: string }> = [];
+
+        function visit(node: unknown) {
+          if (!node || typeof node !== "object") {
+            return;
+          }
+
+          if (Array.isArray(node)) {
+            node.forEach(visit);
+            return;
+          }
+
+          const record = node as Record<string, unknown>;
+          const renderer = record.transcriptSegmentRenderer as
+            | {
+                startMs?: string;
+                endMs?: string;
+                snippet?: {
+                  runs?: Array<{ text?: string }>;
+                };
+              }
+            | undefined;
+
+          if (renderer?.snippet?.runs) {
+            const startMs = Number(renderer.startMs);
+            const endMs = Number(renderer.endMs);
+            const text = normalizeCaptionText(
+              renderer.snippet.runs.map((run) => run.text || "").join("")
+            );
+
+            if (text && Number.isFinite(startMs)) {
+              const startTime = startMs / 1000;
+              const endTime = Number.isFinite(endMs) && endMs > startMs ? endMs / 1000 : startTime + 3;
+              segments.push({ startTime, endTime, text });
+            }
+
+            return;
+          }
+
+          Object.values(record).forEach(visit);
+        }
+
+        visit(value);
+
+        return segments;
+      }
+
+      async function fetchTranscriptSegments() {
+        const initialData = readInitialData();
+        const endpointContainer = findObjectWithKey(initialData, "getTranscriptEndpoint");
+        const params =
+          (
+            endpointContainer?.getTranscriptEndpoint as
+              | {
+                  params?: string;
+                }
+              | undefined
+          )?.params || "";
+        const apiKey = String(readYtcfgValue("INNERTUBE_API_KEY") || "");
+        const context = readYtcfgValue("INNERTUBE_CONTEXT") as
+          | {
+              client?: {
+                clientName?: string;
+                clientVersion?: string;
+                visitorData?: string;
+              };
+            }
+          | null;
+
+        if (!params || !apiKey || !context) {
+          return null;
+        }
+
+        const response = await fetch(`https://www.youtube.com/youtubei/v1/get_transcript?key=${apiKey}`, {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            "Content-Type": "application/json",
+            "X-YouTube-Client-Name": String(context.client?.clientName || "1"),
+            "X-YouTube-Client-Version": String(context.client?.clientVersion || ""),
+            "X-Goog-Visitor-Id": String(context.client?.visitorData || "")
+          },
+          body: JSON.stringify({
+            context,
+            params
+          })
+        });
+
+        if (!response.ok) {
+          return null;
+        }
+
+        const data = await response.json();
+        const segments = parseTranscriptSegments(data);
+
+        return segments.length > 0 ? segments : null;
+      }
+
+      const playerResponse = (await readPlayerResponse()) as
+        | {
+            captions?: {
+              playerCaptionsTracklistRenderer?: {
+                captionTracks?: PageCaptionTrack[];
+              };
+            };
+          }
+        | null;
+      const captionTracks =
+        playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+      const selectedTrack = chooseEnglishCaptionTrack(captionTracks);
+
+      if (!selectedTrack?.baseUrl || typeof selectedTrack.baseUrl !== "string") {
+        return {
+          ok: false,
+          errorCode: "NO_ENGLISH_CAPTIONS",
+          message: "当前视频无法解析：没有可获取的英文字幕。"
+        };
+      }
+
+      const captionUrl = new URL(selectedTrack.baseUrl);
+      captionUrl.searchParams.set("fmt", "json3");
+
+      const response = await fetch(captionUrl.toString(), {
+        credentials: "include"
+      });
+
+      if (!response.ok) {
+        return {
+          ok: false,
+          errorCode: "CAPTION_REQUEST_FAILED",
+          message: "当前视频无法解析：英文字幕请求失败。"
+        };
+      }
+
+      const text = await response.text();
+
+      if (!text.trim()) {
+        const transcriptSegments = await fetchTranscriptSegments();
+
+        if (transcriptSegments) {
+          return {
+            ok: true,
+            payload: {
+              track: {
+                languageCode: String(selectedTrack.languageCode || "en"),
+                name: "English transcript",
+                kind: String(selectedTrack.kind || "standard")
+              },
+              segments: transcriptSegments
+            }
+          };
+        }
+
+        return {
+          ok: false,
+          errorCode: "EMPTY_CAPTION_RESPONSE",
+          message: "当前视频无法解析：英文字幕接口返回空内容。"
+        };
+      }
+
+      let data: {
+        events?: Array<{
+          tStartMs?: number;
+          dDurationMs?: number;
+          segs?: Array<{ utf8?: string }>;
+        }>;
+      };
+
+      try {
+        data = JSON.parse(text);
+      } catch {
+        return {
+          ok: false,
+          errorCode: "CAPTION_PARSE_FAILED",
+          message: "当前视频无法解析：英文字幕格式解析失败。"
+        };
+      }
+
+      const segments = (data.events || [])
+        .map((event) => {
+          const captionText = normalizeCaptionText(
+            (event.segs || []).map((segment) => segment.utf8 || "").join("")
+          );
+          const startTime = Number(event.tStartMs) / 1000;
+          const duration = Number(event.dDurationMs || 0) / 1000;
+
+          return {
+            startTime,
+            endTime: startTime + duration,
+            text: captionText
+          };
+        })
+        .filter(
+          (segment) =>
+            segment.text && Number.isFinite(segment.startTime) && Number.isFinite(segment.endTime)
+        );
+
+      if (segments.length === 0) {
+        return {
+          ok: false,
+          errorCode: "EMPTY_CAPTIONS",
+          message: "当前视频无法解析：英文字幕内容为空。"
+        };
+      }
+
+      return {
+        ok: true,
+        payload: {
+          track: {
+            languageCode: String(selectedTrack.languageCode || ""),
+            name:
+              selectedTrack.name?.simpleText ||
+              selectedTrack.name?.runs?.map((run) => run.text || "").join("") ||
+              "",
+            kind: String(selectedTrack.kind || "standard")
+          },
+          segments
+        }
+      };
+    }
+  });
+
+  return (
+    (executionResults[0]?.result as EnglishCaptionsResult | undefined) || {
+      ok: false,
+      errorCode: "CAPTION_SCRIPT_NO_RESULT",
+      message: "当前视频无法解析：英文字幕脚本没有返回结果。"
+    }
+  );
+}
+
+async function requestEnglishCaptions(tabId: number): Promise<EnglishCaptionsResult> {
+  const pageWorldResult = await requestEnglishCaptionsFromPageWorld(tabId);
+
+  if (pageWorldResult.ok) {
+    return pageWorldResult;
+  }
+
+  try {
+    const contentScriptResult = (await chrome.tabs.sendMessage(tabId, {
+      type: ENGLISH_CAPTIONS_REQUEST
+    })) as EnglishCaptionsResult;
+
+    if (contentScriptResult.ok) {
+      return contentScriptResult;
+    }
+  } catch {
+    // The main-world attempt gives the more relevant failure reason.
+  }
+
+  return pageWorldResult;
 }
 
 function createId(prefix: string) {
@@ -335,6 +899,54 @@ function createMockVocabularyItems(segment: SubtitleSegment, selectedText: strin
   }));
 }
 
+function getGenerationSourceLabel(source: GenerationSource) {
+  if (source === "ai") {
+    return "DeepSeek AI";
+  }
+
+  if (source === "failed") {
+    return "生成失败";
+  }
+
+  return "Mock / 历史缓存";
+}
+
+function getChatSourceLabel(source: ChatSource | undefined) {
+  if (source === "loading") {
+    return "DeepSeek AI 生成中";
+  }
+
+  if (source === "ai") {
+    return "DeepSeek AI 回复";
+  }
+
+  if (source === "failed") {
+    return "生成失败";
+  }
+
+  return "Mock AI 回复";
+}
+
+function getChatSourceClassName(source: ChatSource | undefined) {
+  if (source === "loading") {
+    return "text-[#4f6b4a]";
+  }
+
+  if (source === "failed") {
+    return "text-[#9a5a2f]";
+  }
+
+  if (source === "ai") {
+    return "text-[#4f6b4a]";
+  }
+
+  return "text-[#6c7568]";
+}
+
+function getVocabularyTypeFromText(text: string): "word" | "phrase" {
+  return /\s/.test(text.trim()) ? "phrase" : "word";
+}
+
 function getReadableAuthErrorMessage(message: string) {
   const normalizedMessage = message.toLowerCase();
 
@@ -405,12 +1017,66 @@ function getVideoPageState(
   return { status: "readyToParse", videoInfo };
 }
 
+function assertTranscriptCoverage(videoInfo: VideoInfo, segments: RawCaptionSegment[]) {
+  if (!videoInfo.durationSeconds || videoInfo.durationSeconds <= 60) {
+    return;
+  }
+
+  const lastSubtitleEndTime = Math.max(...segments.map((segment) => segment.endTime));
+
+  if (!Number.isFinite(lastSubtitleEndTime) || lastSubtitleEndTime < videoInfo.durationSeconds * 0.75) {
+    throw new Error("当前视频无法解析：获取到的英文字幕正文不完整。");
+  }
+}
+
+function canRetryParsingFromUnparseableState(panelState: PanelState) {
+  if (panelState.status !== "unparseable" || !panelState.videoInfo) {
+    return false;
+  }
+
+  return (
+    panelState.videoInfo.isYouTubeVideoPage &&
+    Boolean(panelState.videoInfo.videoId) &&
+    Boolean(panelState.videoInfo.title) &&
+    panelState.videoInfo.durationSeconds !== null &&
+    panelState.videoInfo.durationSeconds <= 3600
+  );
+}
+
+async function translateSubtitleBatchWithRetry(batch: SubtitleTranslationBatch) {
+  try {
+    return await translateSubtitleBatch(batch);
+  } catch (error) {
+    if (!isRetriableAiTaskError(error)) {
+      throw error;
+    }
+  }
+
+  try {
+    return await translateSubtitleBatch(batch);
+  } catch (error) {
+    if (isRetriableAiTaskError(error)) {
+      throw new Error(`字幕翻译失败：第 ${batch.batchIndex + 1} 批字幕生成不稳定，请稍后点击重新解析。`);
+    }
+
+    throw error;
+  }
+}
+
 function App() {
   const [panelState, setPanelState] = React.useState<PanelState>({ status: "identifying" });
   const [parseStepStatuses, setParseStepStatuses] = React.useState(createInitialParseStepStatuses);
+  const [parseProgressDetail, setParseProgressDetail] = React.useState("");
   const [activeLearningTab, setActiveLearningTab] = React.useState<LearningTabKey>("overview");
   const [currentPlaybackTime, setCurrentPlaybackTime] = React.useState<number | null>(null);
   const [selectedSubtitle, setSelectedSubtitle] = React.useState<SelectedSubtitle | null>(null);
+  const [learningOverview, setLearningOverview] = React.useState<LearningOverview | null>(mockOverview);
+  const [subtitleSegments, setSubtitleSegments] = React.useState<SubtitleSegment[]>(mockSubtitleSegments);
+  const [overviewSource, setOverviewSource] = React.useState<GenerationSource>("mock");
+  const [subtitleSource, setSubtitleSource] = React.useState<GenerationSource>("mock");
+  const [overviewGenerationFailed, setOverviewGenerationFailed] = React.useState(false);
+  const [vocabularyGenerationFailed, setVocabularyGenerationFailed] = React.useState(false);
+  const [vocabularyGenerating, setVocabularyGenerating] = React.useState(false);
   const [chatDraft, setChatDraft] = React.useState("");
   const [mockChatItems, setMockChatItems] = React.useState<MockChatItem[]>([]);
   const [mockNoteItems, setMockNoteItems] = React.useState<MockNoteItem[]>([]);
@@ -426,6 +1092,7 @@ function App() {
   const currentVideoIdRef = React.useRef<string | null>(null);
   const loadedVideoIdRef = React.useRef<string | null>(null);
   const recognizedVideoIdRef = React.useRef<string | null>(null);
+  const captionFailureByVideoIdRef = React.useRef<Record<string, string>>({});
   const suppressNextStorageSaveRef = React.useRef(false);
   const cloudLoadKeyRef = React.useRef<string | null>(null);
   const parseTimeoutIdsRef = React.useRef<number[]>([]);
@@ -485,12 +1152,27 @@ function App() {
 
     void saveStoredLearningState(learningVideoId, {
       parsed: true,
-      chatItems: mockChatItems,
+      overview: learningOverview,
+      subtitleSegments,
+      overviewSource,
+      subtitleSource,
+      overviewGenerationFailed,
+      chatItems: mockChatItems.filter((item) => item.source !== "loading"),
       noteItems: mockNoteItems,
       vocabularyItems: mockVocabularyItems,
       updatedAt: Date.now()
     });
-  }, [learningVideoId, mockChatItems, mockNoteItems, mockVocabularyItems]);
+  }, [
+    learningVideoId,
+    learningOverview,
+    subtitleSegments,
+    overviewSource,
+    subtitleSource,
+    overviewGenerationFailed,
+    mockChatItems,
+    mockNoteItems,
+    mockVocabularyItems
+  ]);
 
   React.useEffect(() => {
     if (!authUser || !currentVideoInfo?.videoId || panelState.status === "identifying" || panelState.status === "parsing") {
@@ -520,6 +1202,11 @@ function App() {
         if (cloudLearningState) {
           learnedVideoIdRef.current = currentVideoInfo.videoId;
           setParseStepStatuses(createCompletedParseStepStatuses());
+          setLearningOverview(cloudLearningState.overview ?? mockOverview);
+          setSubtitleSegments(mockSubtitleSegments);
+          setOverviewSource(cloudLearningState.overview ? "ai" : "mock");
+          setSubtitleSource("mock");
+          setOverviewGenerationFailed(false);
           setMockChatItems(cloudLearningState.chatItems);
           setMockNoteItems(cloudLearningState.noteItems);
           setMockVocabularyItems(cloudLearningState.vocabularyItems);
@@ -555,7 +1242,8 @@ function App() {
       setCloudSyncMessage("正在同步到 Supabase。");
 
       saveCloudLearningState(authUser.id, learningVideoInfo, {
-        chatItems: mockChatItems,
+        overview: learningOverview,
+        chatItems: mockChatItems.filter((item) => item.source !== "loading"),
         noteItems: mockNoteItems,
         vocabularyItems: mockVocabularyItems
       })
@@ -572,7 +1260,7 @@ function App() {
     return () => {
       window.clearTimeout(timeoutId);
     };
-  }, [authUser, learningVideoId, mockChatItems, mockNoteItems, mockVocabularyItems]);
+  }, [authUser, learningVideoId, learningOverview, mockChatItems, mockNoteItems, mockVocabularyItems]);
 
   React.useEffect(() => {
     let disposed = false;
@@ -585,6 +1273,14 @@ function App() {
     function resetLearningDataForCurrentVideo() {
       setActiveLearningTab("overview");
       setSelectedSubtitle(null);
+      setParseProgressDetail("");
+      setLearningOverview(mockOverview);
+      setSubtitleSegments(mockSubtitleSegments);
+      setOverviewSource("mock");
+      setSubtitleSource("mock");
+      setOverviewGenerationFailed(false);
+      setVocabularyGenerationFailed(false);
+      setVocabularyGenerating(false);
       setChatDraft("");
       setMockChatItems([]);
       setMockNoteItems([]);
@@ -612,6 +1308,22 @@ function App() {
 
       recognizedVideoIdRef.current = videoInfo.videoId;
 
+      const captionFailureDetail = captionFailureByVideoIdRef.current[videoInfo.videoId];
+
+      if (
+        captionFailureDetail &&
+        parsingVideoIdRef.current !== videoInfo.videoId &&
+        learnedVideoIdRef.current !== videoInfo.videoId
+      ) {
+        setPanelState({
+          status: "unparseable",
+          reason: "当前视频无法解析",
+          detail: captionFailureDetail,
+          videoInfo
+        });
+        return;
+      }
+
       if (parsingVideoIdRef.current === videoInfo.videoId) {
         setPanelState(nextState);
         return;
@@ -633,6 +1345,11 @@ function App() {
         if (storedLearningState) {
           learnedVideoIdRef.current = videoInfo.videoId;
           setParseStepStatuses(createCompletedParseStepStatuses());
+          setLearningOverview(storedLearningState.overview ?? mockOverview);
+          setSubtitleSegments(storedLearningState.subtitleSegments ?? mockSubtitleSegments);
+          setOverviewSource(storedLearningState.overviewSource ?? (storedLearningState.overview ? "ai" : "mock"));
+          setSubtitleSource(storedLearningState.subtitleSource ?? (storedLearningState.subtitleSegments ? "ai" : "mock"));
+          setOverviewGenerationFailed(Boolean(storedLearningState.overviewGenerationFailed));
           setMockChatItems(storedLearningState.chatItems);
           setMockNoteItems(storedLearningState.noteItems);
           setMockVocabularyItems(storedLearningState.vocabularyItems);
@@ -760,7 +1477,7 @@ function App() {
     };
   }, []);
 
-  function handleStartParsing(videoInfo: VideoInfo) {
+  async function handleStartParsing(videoInfo: VideoInfo) {
     if (!videoInfo.videoId) {
       return;
     }
@@ -769,41 +1486,113 @@ function App() {
     parseTimeoutIdsRef.current = [];
     learnedVideoIdRef.current = null;
     parsingVideoIdRef.current = videoInfo.videoId;
+    delete captionFailureByVideoIdRef.current[videoInfo.videoId];
+    setLearningOverview(null);
+    setSubtitleSegments([]);
+    setOverviewSource("mock");
+    setSubtitleSource("mock");
+    setOverviewGenerationFailed(false);
+    setVocabularyGenerationFailed(false);
+    setVocabularyGenerating(false);
+    setParseProgressDetail("");
     setParseStepStatuses(createInitialParseStepStatuses());
     setPanelState({ status: "parsing", videoInfo });
 
-    MOCK_PARSE_STEPS.forEach((step, index) => {
-      const processingTimeoutId = window.setTimeout(() => {
+    function setStepsStatus(stepKeys: string[], status: ParseStepStatus) {
+      setParseStepStatuses((currentStatuses) => {
+        const nextStatuses = { ...currentStatuses };
+
+        stepKeys.forEach((stepKey) => {
+          nextStatuses[stepKey] = status;
+        });
+
+        return nextStatuses;
+      });
+    }
+
+    try {
+      setStepsStatus(["fetch_captions"], "processing");
+      const transcript = await fetchTranscriptWithCaptionProvider({
+        videoUrl: videoInfo.url,
+        videoId: videoInfo.videoId,
+        language: "en"
+      });
+      assertTranscriptCoverage(videoInfo, transcript.segments);
+
+      setStepsStatus(["fetch_captions"], "completed");
+      setStepsStatus(["segment_subtitles", "translate_subtitles"], "processing");
+
+      setParseProgressDetail("正在重切分字幕并准备翻译批次。");
+      const translationBatches = await prepareSubtitleTranslationBatches(transcript.segments);
+
+      if (translationBatches.length === 0) {
+        throw new Error("当前视频无法解析：英文字幕内容为空。");
+      }
+
+      const generatedSegments: SubtitleSegment[] = [];
+
+      for (const batch of translationBatches) {
         if (parsingVideoIdRef.current !== videoInfo.videoId) {
           return;
         }
 
-        setParseStepStatuses((currentStatuses) => ({
-          ...currentStatuses,
-          [step.key]: "processing"
-        }));
-      }, index * 900);
+        setParseProgressDetail(`字幕翻译：已完成 ${batch.batchIndex} / ${translationBatches.length} 批。`);
+        generatedSegments.push(...await translateSubtitleBatchWithRetry(batch));
+      }
 
-      const completedTimeoutId = window.setTimeout(() => {
+      if (parsingVideoIdRef.current !== videoInfo.videoId) {
+        return;
+      }
+
+      setParseProgressDetail(`字幕翻译：已完成 ${translationBatches.length} / ${translationBatches.length} 批。`);
+      setSubtitleSegments(generatedSegments);
+      setSubtitleSource("ai");
+      setStepsStatus(["segment_subtitles", "translate_subtitles"], "completed");
+
+      try {
+        setParseProgressDetail("正在生成视频总览。");
+        setStepsStatus(["generate_summary", "generate_chapters_timeline", "generate_mindmap"], "processing");
+        const generatedOverview = await generateOverviewForLongVideo(generatedSegments);
+
         if (parsingVideoIdRef.current !== videoInfo.videoId) {
           return;
         }
 
-        setParseStepStatuses((currentStatuses) => ({
-          ...currentStatuses,
-          [step.key]: "completed"
-        }));
+        setLearningOverview(generatedOverview);
+        setOverviewSource("ai");
+        setStepsStatus(["generate_summary", "generate_chapters_timeline", "generate_mindmap"], "completed");
+      } catch {
+        setOverviewGenerationFailed(true);
+        setOverviewSource("failed");
+        setLearningOverview(null);
+        setStepsStatus(["generate_summary", "generate_chapters_timeline", "generate_mindmap"], "failed");
+      }
 
-        if (index === MOCK_PARSE_STEPS.length - 1) {
-          parsingVideoIdRef.current = null;
-          learnedVideoIdRef.current = videoInfo.videoId;
-          setActiveLearningTab("overview");
-          setPanelState({ status: "learning", videoInfo });
-        }
-      }, index * 900 + 650);
-
-      parseTimeoutIdsRef.current.push(processingTimeoutId, completedTimeoutId);
-    });
+      setStepsStatus(["save_results"], "processing");
+      setParseProgressDetail("正在保存解析结果。");
+      setStepsStatus(["save_results"], "completed");
+      setParseProgressDetail("");
+      parsingVideoIdRef.current = null;
+      learnedVideoIdRef.current = videoInfo.videoId;
+      setActiveLearningTab("overview");
+      setPanelState({ status: "learning", videoInfo });
+    } catch (error) {
+      parsingVideoIdRef.current = null;
+      setParseProgressDetail("");
+      setSubtitleSource("failed");
+      setStepsStatus(["fetch_captions", "segment_subtitles", "translate_subtitles"], "failed");
+      const failureDetail =
+        error instanceof Error && error.message
+          ? error.message
+          : "没有成功获取当前视频的英文字幕。Video Insight MVP 暂只支持可获取英文字幕的视频。";
+      captionFailureByVideoIdRef.current[videoInfo.videoId] = failureDetail;
+      setPanelState({
+        status: "unparseable",
+        reason: "当前视频无法解析",
+        detail: failureDetail,
+        videoInfo
+      });
+    }
   }
 
   async function handleSeekToTime(timeSeconds: number) {
@@ -841,15 +1630,53 @@ function App() {
     clearSelectedSubtitle();
   }
 
-  function handleSendChatDraft() {
+  async function handleSendChatDraft() {
     const trimmedDraft = chatDraft.trim();
 
     if (!trimmedDraft) {
       return;
     }
 
-    setMockChatItems((items) => [createMockChatItem(trimmedDraft), ...items]);
+    const chatId = createId("chat");
     setChatDraft("");
+    setMockChatItems((items) => [
+      {
+        id: chatId,
+        question: trimmedDraft,
+        answer: "",
+        source: "loading"
+      },
+      ...items
+    ]);
+
+    try {
+      const answer = await answerQuestionWithAi({
+        question: trimmedDraft,
+        videoTitle: learningVideoInfo?.title ?? "",
+        overviewSummary: learningOverview?.summary ?? mockOverview.summary,
+        subtitles: subtitleSegments,
+        recentChat: mockChatItems.slice(0, 4).map((item) => ({
+          question: item.question,
+          answer: item.answer
+        }))
+      });
+
+      setMockChatItems((items) =>
+        items.map((item) => (item.id === chatId ? { ...item, answer, source: "ai" } : item))
+      );
+    } catch {
+      setMockChatItems((items) =>
+        items.map((item) =>
+          item.id === chatId
+            ? {
+                ...item,
+                answer: "生成失败。请确认 ai-tasks Edge Function 已重新部署，并且 DeepSeek API Key 可用。",
+                source: "failed"
+              }
+            : item
+        )
+      );
+    }
   }
 
   function handleCreateNoteFromSubtitle() {
@@ -865,17 +1692,92 @@ function App() {
     clearSelectedSubtitle();
   }
 
-  function handleAddVocabularyFromSubtitle() {
+  async function handleAddVocabularyFromSubtitle() {
     if (!selectedSubtitle) {
       return;
     }
 
-    setMockVocabularyItems((items) => [
-      ...createMockVocabularyItems(selectedSubtitle.segment, selectedSubtitle.text),
-      ...items
-    ]);
+    const subtitle = selectedSubtitle;
     setActiveLearningTab("vocabulary");
     clearSelectedSubtitle();
+    setVocabularyGenerationFailed(false);
+    setVocabularyGenerating(true);
+
+    try {
+      const generatedItem = await generateVocabularyItemWithAi({
+        selectedText: subtitle.text,
+        sourceSentence: subtitle.segment.englishText,
+        sourceTranslation: subtitle.segment.chineseText,
+        videoContext: learningOverview?.summary ?? mockOverview.summary
+      });
+      const normalizedText = generatedItem.normalizedText.trim() || subtitle.text;
+
+      setMockVocabularyItems((items) => [
+        {
+          id: createId("vocab"),
+          text: normalizedText,
+          type: getVocabularyTypeFromText(normalizedText),
+          meaningZh: generatedItem.meaningZh,
+          sourceSentence: subtitle.segment.englishText,
+          sourceTranslation: subtitle.segment.chineseText,
+          generatedExamples: []
+        },
+        ...items
+      ]);
+    } catch {
+      setVocabularyGenerationFailed(true);
+    } finally {
+      setVocabularyGenerating(false);
+    }
+  }
+
+  async function handleGenerateMoreVocabularyExamples(vocabularyItemId: string) {
+    const vocabularyItem = mockVocabularyItems.find((item) => item.id === vocabularyItemId);
+
+    if (!vocabularyItem) {
+      return;
+    }
+
+    setMockVocabularyItems((items) =>
+      items.map((item) =>
+        item.id === vocabularyItemId
+          ? { ...item, examplesGenerating: true, examplesGenerationFailed: false }
+          : item
+      )
+    );
+
+    try {
+      const examples = await generateVocabularyExamplesWithAi({
+        text: vocabularyItem.text,
+        type: vocabularyItem.type,
+        meaningZh: vocabularyItem.meaningZh,
+        sourceSentence: vocabularyItem.sourceSentence,
+        sourceTranslation: vocabularyItem.sourceTranslation,
+        videoContext: learningOverview?.summary ?? mockOverview.summary,
+        existingExamples: vocabularyItem.generatedExamples ?? []
+      });
+
+      setMockVocabularyItems((items) =>
+        items.map((item) =>
+          item.id === vocabularyItemId
+            ? {
+                ...item,
+                generatedExamples: [...(item.generatedExamples ?? []), ...examples],
+                examplesGenerating: false,
+                examplesGenerationFailed: false
+              }
+            : item
+        )
+      );
+    } catch {
+      setMockVocabularyItems((items) =>
+        items.map((item) =>
+          item.id === vocabularyItemId
+            ? { ...item, examplesGenerating: false, examplesGenerationFailed: true }
+            : item
+        )
+      );
+    }
   }
 
   function handleUpdateNoteComment(noteId: string, userComment: string) {
@@ -884,14 +1786,40 @@ function App() {
     );
   }
 
-  function handleOrganizeNote(noteId: string) {
+  async function handleOrganizeNote(noteId: string) {
+    const noteItem = mockNoteItems.find((item) => item.id === noteId);
+
+    if (!noteItem) {
+      return;
+    }
+
     setMockNoteItems((items) =>
       items.map((item) =>
-        item.id === noteId
-          ? { ...item, aiOrganizedText: createMockOrganizedNote(item.sourceText) }
-          : item
+        item.id === noteId ? { ...item, aiOrganizing: true, aiOrganizeFailed: false } : item
       )
     );
+
+    try {
+      const organizedText = await organizeNoteWithAi({
+        sourceText: noteItem.sourceText,
+        sourceTranslation: noteItem.sourceTranslation,
+        previousOrganizedText: noteItem.aiOrganizedText
+      });
+
+      setMockNoteItems((items) =>
+        items.map((item) =>
+          item.id === noteId
+            ? { ...item, aiOrganizedText: organizedText, aiOrganizeFailed: false, aiOrganizing: false }
+            : item
+        )
+      );
+    } catch {
+      setMockNoteItems((items) =>
+        items.map((item) =>
+          item.id === noteId ? { ...item, aiOrganizeFailed: true, aiOrganizing: false } : item
+        )
+      );
+    }
   }
 
   function handleCancelNote(noteId: string) {
@@ -1006,9 +1934,17 @@ function App() {
         <PanelContent
           panelState={panelState}
           parseStepStatuses={parseStepStatuses}
+          parseProgressDetail={parseProgressDetail}
           activeLearningTab={activeLearningTab}
           currentPlaybackTime={currentPlaybackTime}
           selectedSubtitle={selectedSubtitle}
+          learningOverview={learningOverview}
+          subtitleSegments={subtitleSegments}
+          overviewSource={overviewSource}
+          subtitleSource={subtitleSource}
+          overviewGenerationFailed={overviewGenerationFailed}
+          vocabularyGenerationFailed={vocabularyGenerationFailed}
+          vocabularyGenerating={vocabularyGenerating}
           chatDraft={chatDraft}
           mockChatItems={mockChatItems}
           mockNoteItems={mockNoteItems}
@@ -1023,6 +1959,7 @@ function App() {
           onAskAiFromSubtitle={handleAskAiFromSubtitle}
           onCreateNoteFromSubtitle={handleCreateNoteFromSubtitle}
           onAddVocabularyFromSubtitle={handleAddVocabularyFromSubtitle}
+          onGenerateMoreVocabularyExamples={handleGenerateMoreVocabularyExamples}
           onCopySelectedSubtitle={handleCopySelectedSubtitle}
           onUpdateNoteComment={handleUpdateNoteComment}
           onOrganizeNote={handleOrganizeNote}
@@ -1031,7 +1968,7 @@ function App() {
         />
 
         <p className="mt-auto text-sm leading-6 text-[#6c7568]">
-          Phase 9 使用 Supabase Auth 和数据库同步学习状态。真实 AI 和真实字幕会在后续阶段加入。
+          Phase 11 使用当前 YouTube 页面中的英文字幕轨作为解析输入。无可获取英文字幕的视频会显示无法解析。
         </p>
       </section>
     </main>
@@ -1230,9 +2167,17 @@ function getCloudSyncStatusText(status: CloudSyncStatus, message: string) {
 function PanelContent({
   panelState,
   parseStepStatuses,
+  parseProgressDetail,
   activeLearningTab,
   currentPlaybackTime,
   selectedSubtitle,
+  learningOverview,
+  subtitleSegments,
+  overviewSource,
+  subtitleSource,
+  overviewGenerationFailed,
+  vocabularyGenerationFailed,
+  vocabularyGenerating,
   chatDraft,
   mockChatItems,
   mockNoteItems,
@@ -1247,6 +2192,7 @@ function PanelContent({
   onAskAiFromSubtitle,
   onCreateNoteFromSubtitle,
   onAddVocabularyFromSubtitle,
+  onGenerateMoreVocabularyExamples,
   onCopySelectedSubtitle,
   onUpdateNoteComment,
   onOrganizeNote,
@@ -1255,23 +2201,32 @@ function PanelContent({
 }: {
   panelState: PanelState;
   parseStepStatuses: Record<string, ParseStepStatus>;
+  parseProgressDetail: string;
   activeLearningTab: LearningTabKey;
   currentPlaybackTime: number | null;
   selectedSubtitle: SelectedSubtitle | null;
+  learningOverview: LearningOverview | null;
+  subtitleSegments: SubtitleSegment[];
+  overviewSource: GenerationSource;
+  subtitleSource: GenerationSource;
+  overviewGenerationFailed: boolean;
+  vocabularyGenerationFailed: boolean;
+  vocabularyGenerating: boolean;
   mockChatItems: MockChatItem[];
   mockNoteItems: MockNoteItem[];
   mockVocabularyItems: MockVocabularyItem[];
   chatDraft: string;
   onSelectLearningTab: (tabKey: LearningTabKey) => void;
   onChatDraftChange: (draft: string) => void;
-  onSendChatDraft: () => void;
-  onStartParsing: (videoInfo: VideoInfo) => void;
+  onSendChatDraft: () => void | Promise<void>;
+  onStartParsing: (videoInfo: VideoInfo) => void | Promise<void>;
   onSeekToTime: (timeSeconds: number) => void;
   onSelectSubtitle: (selection: SelectedSubtitle) => void;
   onClearSelectedSubtitle: () => void;
   onAskAiFromSubtitle: () => void;
   onCreateNoteFromSubtitle: () => void;
   onAddVocabularyFromSubtitle: () => void;
+  onGenerateMoreVocabularyExamples: (vocabularyItemId: string) => void;
   onCopySelectedSubtitle: () => void;
   onUpdateNoteComment: (noteId: string, userComment: string) => void;
   onOrganizeNote: (noteId: string) => void;
@@ -1283,17 +2238,33 @@ function PanelContent({
   }
 
   if (panelState.status === "unparseable") {
+    const canRetryParsing = canRetryParsingFromUnparseableState(panelState);
+
     return (
       <StatusCard
         title={panelState.reason}
         description={panelState.detail}
         tone="warning"
+        action={
+          canRetryParsing
+            ? {
+                label: "重新解析",
+                onClick: () => onStartParsing(panelState.videoInfo as VideoInfo)
+              }
+            : undefined
+        }
       />
     );
   }
 
   if (panelState.status === "parsing") {
-    return <ParsingCard videoInfo={panelState.videoInfo} parseStepStatuses={parseStepStatuses} />;
+    return (
+      <ParsingCard
+        videoInfo={panelState.videoInfo}
+        parseStepStatuses={parseStepStatuses}
+        parseProgressDetail={parseProgressDetail}
+      />
+    );
   }
 
   if (panelState.status === "learning") {
@@ -1303,6 +2274,13 @@ function PanelContent({
         activeLearningTab={activeLearningTab}
         currentPlaybackTime={currentPlaybackTime}
         selectedSubtitle={selectedSubtitle}
+        learningOverview={learningOverview}
+        subtitleSegments={subtitleSegments}
+        overviewSource={overviewSource}
+        subtitleSource={subtitleSource}
+        overviewGenerationFailed={overviewGenerationFailed}
+        vocabularyGenerationFailed={vocabularyGenerationFailed}
+        vocabularyGenerating={vocabularyGenerating}
         chatDraft={chatDraft}
         mockChatItems={mockChatItems}
         mockNoteItems={mockNoteItems}
@@ -1310,12 +2288,14 @@ function PanelContent({
         onSelectLearningTab={onSelectLearningTab}
         onChatDraftChange={onChatDraftChange}
         onSendChatDraft={onSendChatDraft}
+        onStartParsing={onStartParsing}
         onSeekToTime={onSeekToTime}
         onSelectSubtitle={onSelectSubtitle}
         onClearSelectedSubtitle={onClearSelectedSubtitle}
         onAskAiFromSubtitle={onAskAiFromSubtitle}
         onCreateNoteFromSubtitle={onCreateNoteFromSubtitle}
         onAddVocabularyFromSubtitle={onAddVocabularyFromSubtitle}
+        onGenerateMoreVocabularyExamples={onGenerateMoreVocabularyExamples}
         onCopySelectedSubtitle={onCopySelectedSubtitle}
         onUpdateNoteComment={onUpdateNoteComment}
         onOrganizeNote={onOrganizeNote}
@@ -1331,11 +2311,16 @@ function PanelContent({
 function StatusCard({
   title,
   description,
-  tone = "neutral"
+  tone = "neutral",
+  action
 }: {
   title: string;
   description: string;
   tone?: "neutral" | "warning";
+  action?: {
+    label: string;
+    onClick: () => void | Promise<void>;
+  };
 }) {
   const toneClassName =
     tone === "warning" ? "border-[#ead8b7] bg-[#fffaf0]" : "border-[#dfe4dc] bg-white/70";
@@ -1344,6 +2329,15 @@ function StatusCard({
     <section className={`rounded-lg border p-4 shadow-sm ${toneClassName}`}>
       <p className="text-base font-semibold">{title}</p>
       <p className="mt-2 text-sm leading-6 text-[#6c7568]">{description}</p>
+      {action ? (
+        <button
+          type="button"
+          className="mt-4 w-full rounded-md bg-[#20241f] px-4 py-3 text-sm font-semibold text-white transition hover:bg-[#343a31]"
+          onClick={action.onClick}
+        >
+          {action.label}
+        </button>
+      ) : null}
     </section>
   );
 }
@@ -1357,9 +2351,9 @@ function ReadyToParseCard({
 }) {
   return (
     <section className="rounded-lg border border-[#dfe4dc] bg-white/70 p-4 shadow-sm">
-      <p className="text-sm font-semibold text-[#4f6b4a]">当前视频可解析</p>
+      <p className="text-sm font-semibold text-[#4f6b4a]">当前视频可尝试解析</p>
       <p className="mt-2 text-sm leading-6 text-[#6c7568]">
-        已读取视频基础信息。点击下方按钮后，会展示 mock 解析进度。
+        已读取视频基础信息。点击下方按钮后，会先获取英文字幕；如果无法获取，会显示无法解析。
       </p>
       <VideoSummary videoInfo={videoInfo} />
       <button
@@ -1375,22 +2369,30 @@ function ReadyToParseCard({
 
 function ParsingCard({
   videoInfo,
-  parseStepStatuses
+  parseStepStatuses,
+  parseProgressDetail
 }: {
   videoInfo: VideoInfo;
   parseStepStatuses: Record<string, ParseStepStatus>;
+  parseProgressDetail: string;
 }) {
   const completedCount = MOCK_PARSE_STEPS.filter(
     (step) => parseStepStatuses[step.key] === "completed"
   ).length;
+  const hasFailedStep = MOCK_PARSE_STEPS.some((step) => parseStepStatuses[step.key] === "failed");
   const progressPercent = Math.round((completedCount / MOCK_PARSE_STEPS.length) * 100);
 
   return (
     <section className="rounded-lg border border-[#dfe4dc] bg-white/70 p-4 shadow-sm">
       <p className="text-sm font-semibold text-[#4f6b4a]">解析中</p>
       <p className="mt-2 text-sm leading-6 text-[#6c7568]">
-        正在按 PRD 的解析步骤模拟处理，当前不调用 AI、不保存数据库、不获取真实字幕。
+        正在获取当前视频英文字幕，并交给 DeepSeek 重切分、翻译和生成总览。
       </p>
+      {parseProgressDetail ? (
+        <p className="mt-2 rounded-md border border-[#dfe4dc] bg-[#fbfcf8] px-3 py-2 text-sm font-medium text-[#4f6b4a]">
+          {parseProgressDetail}
+        </p>
+      ) : null}
       <VideoSummary videoInfo={videoInfo} />
       <div className="mt-5 h-2 overflow-hidden rounded-full bg-[#e4e8df]">
         <div
@@ -1404,6 +2406,11 @@ function ParsingCard({
           <ParseStepItem key={step.key} label={step.label} status={parseStepStatuses[step.key]} />
         ))}
       </ol>
+      {hasFailedStep ? (
+        <div className="mt-4">
+          <GeneratedFailure title="生成失败" />
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -1449,6 +2456,13 @@ function LearningView({
   activeLearningTab,
   currentPlaybackTime,
   selectedSubtitle,
+  learningOverview,
+  subtitleSegments,
+  overviewSource,
+  subtitleSource,
+  overviewGenerationFailed,
+  vocabularyGenerationFailed,
+  vocabularyGenerating,
   chatDraft,
   mockChatItems,
   mockNoteItems,
@@ -1456,12 +2470,14 @@ function LearningView({
   onSelectLearningTab,
   onChatDraftChange,
   onSendChatDraft,
+  onStartParsing,
   onSeekToTime,
   onSelectSubtitle,
   onClearSelectedSubtitle,
   onAskAiFromSubtitle,
   onCreateNoteFromSubtitle,
   onAddVocabularyFromSubtitle,
+  onGenerateMoreVocabularyExamples,
   onCopySelectedSubtitle,
   onUpdateNoteComment,
   onOrganizeNote,
@@ -1472,19 +2488,28 @@ function LearningView({
   activeLearningTab: LearningTabKey;
   currentPlaybackTime: number | null;
   selectedSubtitle: SelectedSubtitle | null;
+  learningOverview: LearningOverview | null;
+  subtitleSegments: SubtitleSegment[];
+  overviewSource: GenerationSource;
+  subtitleSource: GenerationSource;
+  overviewGenerationFailed: boolean;
+  vocabularyGenerationFailed: boolean;
+  vocabularyGenerating: boolean;
   chatDraft: string;
   mockChatItems: MockChatItem[];
   mockNoteItems: MockNoteItem[];
   mockVocabularyItems: MockVocabularyItem[];
   onSelectLearningTab: (tabKey: LearningTabKey) => void;
   onChatDraftChange: (draft: string) => void;
-  onSendChatDraft: () => void;
+  onSendChatDraft: () => void | Promise<void>;
+  onStartParsing: (videoInfo: VideoInfo) => void | Promise<void>;
   onSeekToTime: (timeSeconds: number) => void;
   onSelectSubtitle: (selection: SelectedSubtitle) => void;
   onClearSelectedSubtitle: () => void;
   onAskAiFromSubtitle: () => void;
   onCreateNoteFromSubtitle: () => void;
   onAddVocabularyFromSubtitle: () => void;
+  onGenerateMoreVocabularyExamples: (vocabularyItemId: string) => void;
   onCopySelectedSubtitle: () => void;
   onUpdateNoteComment: (noteId: string, userComment: string) => void;
   onOrganizeNote: (noteId: string) => void;
@@ -1493,6 +2518,24 @@ function LearningView({
 }) {
   return (
     <div className="space-y-4">
+      <section className="flex items-center justify-between gap-3 rounded-lg border border-[#dfe4dc] bg-white/70 p-3 text-xs shadow-sm">
+        <div className="min-w-0 leading-5 text-[#6c7568]">
+          <span className="font-semibold text-[#4f6b4a]">
+            {overviewSource === "ai" || subtitleSource === "ai" ? "DeepSeek AI 已参与生成" : "当前展示 Mock / 历史缓存"}
+          </span>
+          <span className="ml-2">
+            字幕：{getGenerationSourceLabel(subtitleSource)} · 总览：{getGenerationSourceLabel(overviewSource)}
+          </span>
+        </div>
+        <button
+          type="button"
+          className="shrink-0 rounded-md border border-[#20241f] px-3 py-2 font-semibold text-[#20241f] transition hover:bg-[#eef5e8]"
+          onClick={() => onStartParsing(videoInfo)}
+        >
+          重新解析
+        </button>
+      </section>
+
       <nav className="grid grid-cols-5 rounded-lg border border-[#dfe4dc] bg-white/70 p-1 shadow-sm">
         {LEARNING_TABS.map((tab) => {
           const isActive = activeLearningTab === tab.key;
@@ -1517,6 +2560,13 @@ function LearningView({
           activeLearningTab={activeLearningTab}
           videoInfo={videoInfo}
           currentPlaybackTime={currentPlaybackTime}
+          learningOverview={learningOverview}
+          subtitleSegments={subtitleSegments}
+          overviewSource={overviewSource}
+          subtitleSource={subtitleSource}
+          overviewGenerationFailed={overviewGenerationFailed}
+          vocabularyGenerationFailed={vocabularyGenerationFailed}
+          vocabularyGenerating={vocabularyGenerating}
           chatDraft={chatDraft}
           mockChatItems={mockChatItems}
           mockNoteItems={mockNoteItems}
@@ -1525,6 +2575,7 @@ function LearningView({
           onSendChatDraft={onSendChatDraft}
           onSeekToTime={onSeekToTime}
           onSelectSubtitle={onSelectSubtitle}
+          onGenerateMoreVocabularyExamples={onGenerateMoreVocabularyExamples}
           onUpdateNoteComment={onUpdateNoteComment}
           onOrganizeNote={onOrganizeNote}
           onCancelNote={onCancelNote}
@@ -1549,6 +2600,13 @@ function LearningTabContent({
   activeLearningTab,
   videoInfo,
   currentPlaybackTime,
+  learningOverview,
+  subtitleSegments,
+  overviewSource,
+  subtitleSource,
+  overviewGenerationFailed,
+  vocabularyGenerationFailed,
+  vocabularyGenerating,
   chatDraft,
   mockChatItems,
   mockNoteItems,
@@ -1557,6 +2615,7 @@ function LearningTabContent({
   onSendChatDraft,
   onSeekToTime,
   onSelectSubtitle,
+  onGenerateMoreVocabularyExamples,
   onUpdateNoteComment,
   onOrganizeNote,
   onCancelNote,
@@ -1565,14 +2624,22 @@ function LearningTabContent({
   activeLearningTab: LearningTabKey;
   videoInfo: VideoInfo;
   currentPlaybackTime: number | null;
+  learningOverview: LearningOverview | null;
+  subtitleSegments: SubtitleSegment[];
+  overviewSource: GenerationSource;
+  subtitleSource: GenerationSource;
+  overviewGenerationFailed: boolean;
+  vocabularyGenerationFailed: boolean;
+  vocabularyGenerating: boolean;
   chatDraft: string;
   mockChatItems: MockChatItem[];
   mockNoteItems: MockNoteItem[];
   mockVocabularyItems: MockVocabularyItem[];
   onChatDraftChange: (draft: string) => void;
-  onSendChatDraft: () => void;
+  onSendChatDraft: () => void | Promise<void>;
   onSeekToTime: (timeSeconds: number) => void;
   onSelectSubtitle: (selection: SelectedSubtitle) => void;
+  onGenerateMoreVocabularyExamples: (vocabularyItemId: string) => void;
   onUpdateNoteComment: (noteId: string, userComment: string) => void;
   onOrganizeNote: (noteId: string) => void;
   onCancelNote: (noteId: string) => void;
@@ -1582,7 +2649,11 @@ function LearningTabContent({
     return (
       <>
         <VideoSummary videoInfo={videoInfo} />
-        <OverviewContent />
+        <OverviewContent
+          overview={learningOverview}
+          source={overviewSource}
+          hasGenerationFailed={overviewGenerationFailed}
+        />
       </>
     );
   }
@@ -1590,6 +2661,8 @@ function LearningTabContent({
   if (activeLearningTab === "subtitles") {
     return (
       <SubtitlesContent
+        subtitleSegments={subtitleSegments}
+        source={subtitleSource}
         currentPlaybackTime={currentPlaybackTime}
         onSeekToTime={onSeekToTime}
         onSelectSubtitle={onSelectSubtitle}
@@ -1620,19 +2693,43 @@ function LearningTabContent({
     );
   }
 
-  return <VocabularyContent vocabularyItems={mockVocabularyItems} />;
+  return (
+    <VocabularyContent
+      vocabularyItems={mockVocabularyItems}
+      hasGenerationFailed={vocabularyGenerationFailed}
+      isGenerating={vocabularyGenerating}
+      onGenerateMoreExamples={onGenerateMoreVocabularyExamples}
+    />
+  );
 }
 
-function OverviewContent() {
+function OverviewContent({
+  overview,
+  source,
+  hasGenerationFailed
+}: {
+  overview: LearningOverview | null;
+  source: GenerationSource;
+  hasGenerationFailed: boolean;
+}) {
+  if (hasGenerationFailed || !overview) {
+    return (
+      <div className="mt-5">
+        <GeneratedFailure title="总览生成失败" />
+      </div>
+    );
+  }
+
   return (
     <div className="mt-5 space-y-4">
+      <p className="text-xs font-semibold text-[#4f6b4a]">总览来源：{getGenerationSourceLabel(source)}</p>
       <GeneratedSection title="视频摘要">
-        <p className="text-sm leading-6 text-[#394038]">{mockOverview.summary}</p>
+        <p className="text-sm leading-6 text-[#394038]">{overview.summary}</p>
       </GeneratedSection>
 
       <GeneratedSection title="章节划分">
         <div className="space-y-3">
-          {mockOverview.chapters.map((chapter, index) => (
+          {overview.chapters.map((chapter, index) => (
             <article key={chapter.title} className="rounded-md border border-[#edf0ea] bg-[#fbfcf8] p-3">
               <div className="flex items-start justify-between gap-3">
                 <h3 className="text-sm font-semibold">
@@ -1658,11 +2755,9 @@ function OverviewContent() {
 
       <GeneratedSection title="Mermaid 思维导图">
         <pre className="overflow-auto rounded-md bg-[#20241f] p-3 text-xs leading-5 text-[#f7f8f5]">
-          <code>{mockOverview.mindmapMermaid}</code>
+          <code>{overview.mindmapMermaid}</code>
         </pre>
       </GeneratedSection>
-
-      <GeneratedFailure title="生成失败状态示例" />
     </div>
   );
 }
@@ -1689,15 +2784,19 @@ function GeneratedFailure({ title }: { title: string }) {
 }
 
 function SubtitlesContent({
+  subtitleSegments,
+  source,
   currentPlaybackTime,
   onSeekToTime,
   onSelectSubtitle
 }: {
+  subtitleSegments: SubtitleSegment[];
+  source: GenerationSource;
   currentPlaybackTime: number | null;
   onSeekToTime: (timeSeconds: number) => void;
   onSelectSubtitle: (selection: SelectedSubtitle) => void;
 }) {
-  const activeSubtitleIndex = mockSubtitleSegments.findIndex(
+  const activeSubtitleIndex = subtitleSegments.findIndex(
     (segment) =>
       currentPlaybackTime !== null &&
       currentPlaybackTime >= segment.startTime &&
@@ -1738,10 +2837,13 @@ function SubtitlesContent({
   return (
     <>
       <p className="text-sm leading-6 text-[#6c7568]">
-        当前播放时间：{currentPlaybackTime === null ? "读取中" : formatDuration(Math.floor(currentPlaybackTime))}
+        当前播放时间：{formatDuration(currentPlaybackTime)}
+        <span className="ml-2 text-xs font-semibold text-[#4f6b4a]">
+          字幕来源：{getGenerationSourceLabel(source)}
+        </span>
       </p>
       <div className="mt-5 max-h-[58vh] space-y-3 overflow-y-auto pr-1">
-        {mockSubtitleSegments.map((segment, index) => {
+        {subtitleSegments.map((segment, index) => {
           const isActive = index === activeSubtitleIndex;
 
           return (
@@ -1869,8 +2971,10 @@ function ChatContent({
   chatDraft: string;
   chatItems: MockChatItem[];
   onChatDraftChange: (draft: string) => void;
-  onSendChatDraft: () => void;
+  onSendChatDraft: () => void | Promise<void>;
 }) {
+  const isGenerating = chatItems.some((item) => item.source === "loading");
+
   return (
     <div className="space-y-4">
       <div className="rounded-md border border-[#dfe4dc] bg-white p-3">
@@ -1888,10 +2992,10 @@ function ChatContent({
           <button
             type="button"
             className="rounded-md bg-[#20241f] px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:bg-[#c4cabc]"
-            disabled={!chatDraft.trim()}
+            disabled={!chatDraft.trim() || isGenerating}
             onClick={onSendChatDraft}
           >
-            发送
+            {isGenerating ? "生成中" : "发送"}
           </button>
         </div>
       </div>
@@ -1907,8 +3011,14 @@ function ChatContent({
               <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-[#20241f]">{item.question}</p>
             </div>
             <div className="rounded-md border border-[#dfe4dc] bg-white p-3">
-              <p className="text-xs font-semibold text-[#4f6b4a]">Mock AI 回复</p>
-              <p className="mt-2 text-sm leading-6 text-[#394038]">{item.answer}</p>
+              <p className={`text-xs font-semibold ${getChatSourceClassName(item.source)}`}>
+                {getChatSourceLabel(item.source)}
+              </p>
+              {item.source === "loading" ? (
+                <AiLoadingBlock description="正在结合视频摘要和字幕上下文生成回复。" />
+              ) : (
+                <p className="mt-2 text-sm leading-6 text-[#394038]">{item.answer}</p>
+              )}
             </div>
           </article>
         ))}
@@ -1950,7 +3060,20 @@ function NotesContent({
             <p className="mt-3 text-sm font-semibold leading-6 text-[#20241f]">{item.sourceText}</p>
             <p className="mt-2 text-sm leading-6 text-[#4f5a4c]">{item.sourceTranslation}</p>
 
-            {item.aiOrganizedText ? (
+            {item.aiOrganizing ? (
+              <div className="mt-4 rounded-md border border-[#dfe4dc] bg-white p-3">
+                <p className="text-xs font-semibold text-[#4f6b4a]">AI 整理中</p>
+                <AiLoadingBlock description="正在把选中的字幕整理成可沉淀的中文笔记。" />
+              </div>
+            ) : null}
+
+            {item.aiOrganizeFailed ? (
+              <div className="mt-4">
+                <GeneratedFailure title="笔记整理失败" />
+              </div>
+            ) : null}
+
+            {item.aiOrganizedText && !item.aiOrganizing ? (
               <div className="mt-4 rounded-md border border-[#dfe4dc] bg-white p-3">
                 <p className="text-xs font-semibold text-[#4f6b4a]">AI 整理结果</p>
                 <p className="mt-2 text-sm leading-6 text-[#394038]">{item.aiOrganizedText}</p>
@@ -1967,10 +3090,11 @@ function NotesContent({
             ) : !item.isSaved ? (
               <button
                 type="button"
-                className="mt-4 rounded-md border border-[#dfe4dc] bg-white px-3 py-2 text-sm font-semibold hover:border-[#4f6b4a] hover:bg-[#eef5e8]"
+                className="mt-4 rounded-md border border-[#dfe4dc] bg-white px-3 py-2 text-sm font-semibold hover:border-[#4f6b4a] hover:bg-[#eef5e8] disabled:cursor-not-allowed disabled:bg-[#f1f3ee] disabled:text-[#9aa392]"
+                disabled={item.aiOrganizing}
                 onClick={() => onOrganizeNote(item.id)}
               >
-                用 AI 重新整理
+                {item.aiOrganizing ? "整理中" : "用 AI 重新整理"}
               </button>
             ) : null}
 
@@ -2010,13 +3134,43 @@ function NotesContent({
   );
 }
 
-function VocabularyContent({ vocabularyItems }: { vocabularyItems: MockVocabularyItem[] }) {
+function VocabularyContent({
+  vocabularyItems,
+  hasGenerationFailed,
+  isGenerating,
+  onGenerateMoreExamples
+}: {
+  vocabularyItems: MockVocabularyItem[];
+  hasGenerationFailed: boolean;
+  isGenerating: boolean;
+  onGenerateMoreExamples: (vocabularyItemId: string) => void;
+}) {
+  if (isGenerating && vocabularyItems.length === 0) {
+    return (
+      <AiGeneratingCard
+        title="正在生成生词"
+        description="正在从选中的字幕里提取单词和短语，并生成释义与例句。"
+      />
+    );
+  }
+
+  if (hasGenerationFailed && vocabularyItems.length === 0) {
+    return <GeneratedFailure title="生词生成失败" />;
+  }
+
   if (vocabularyItems.length === 0) {
     return <EmptyState title="暂无数据" description="你还没有在当前视频下加入生词或短语。" />;
   }
 
   return (
     <div className="space-y-3">
+        {isGenerating ? (
+          <AiGeneratingCard
+            title="正在生成生词"
+            description="正在从选中的字幕里提取单词和短语，并生成释义与例句。"
+          />
+        ) : null}
+        {hasGenerationFailed ? <GeneratedFailure title="生词生成失败" /> : null}
         {vocabularyItems.map((item) => (
           <article key={item.id} className="rounded-md border border-[#dfe4dc] bg-[#fbfcf8] p-3">
             <div className="flex items-center justify-between gap-3">
@@ -2026,13 +3180,43 @@ function VocabularyContent({ vocabularyItems }: { vocabularyItems: MockVocabular
               </span>
             </div>
             <p className="mt-2 text-sm font-medium text-[#394038]">{item.meaningZh}</p>
-            <p className="mt-3 text-sm leading-6 text-[#20241f]">{item.sourceSentence}</p>
-            <p className="mt-1 text-sm leading-6 text-[#6c7568]">{item.sourceTranslation}</p>
-            <div className="mt-3 rounded-md bg-white p-3">
-              <p className="text-xs font-semibold text-[#6c7568]">例句</p>
-              <p className="mt-2 text-sm leading-6 text-[#20241f]">{item.example.en}</p>
-              <p className="mt-1 text-sm leading-6 text-[#6c7568]">{item.example.zh}</p>
+            <div className="mt-3 rounded-md border border-[#edf0ea] bg-white p-3">
+              <p className="text-xs font-semibold text-[#6c7568]">来源字幕</p>
+              <p className="mt-2 text-sm leading-6 text-[#20241f]">{item.sourceSentence}</p>
+              <p className="mt-1 text-sm leading-6 text-[#6c7568]">{item.sourceTranslation}</p>
             </div>
+
+            {(item.generatedExamples?.length ?? 0) > 0 ? (
+              <div className="mt-3 rounded-md border border-[#edf0ea] bg-white p-3">
+                <p className="text-xs font-semibold text-[#6c7568]">AI 例句</p>
+                <div className="mt-3 space-y-3">
+                  {item.generatedExamples?.map((example, index) => (
+                    <div key={`${example.en}-${index}`} className="border-t border-[#edf0ea] pt-3 first:border-t-0 first:pt-0">
+                      <p className="text-sm leading-6 text-[#20241f]">{example.en}</p>
+                      <p className="mt-1 text-sm leading-6 text-[#6c7568]">{example.zh}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+
+            {item.examplesGenerationFailed ? (
+              <div className="mt-3">
+                <GeneratedFailure title="例句生成失败" />
+              </div>
+            ) : null}
+
+            {item.examplesGenerating ? (
+              <AiGeneratingCard title="正在生成例句" description="正在生成不重复来源字幕的新例句。" />
+            ) : (
+              <button
+                type="button"
+                className="mt-3 rounded-md border border-[#dfe4dc] bg-white px-3 py-2 text-sm font-semibold hover:border-[#4f6b4a] hover:bg-[#eef5e8]"
+                onClick={() => onGenerateMoreExamples(item.id)}
+              >
+                生成更多例句
+              </button>
+            )}
           </article>
         ))}
     </div>
@@ -2049,6 +3233,30 @@ function EmptyState({ title, description }: { title: string; description: string
       </div>
       <h2 className="mt-4 text-base font-semibold">{title}</h2>
       <p className="mt-2 text-sm leading-6 text-[#6c7568]">{description}</p>
+    </div>
+  );
+}
+
+function AiGeneratingCard({ title, description }: { title: string; description: string }) {
+  return (
+    <section className="rounded-md border border-[#dfe4dc] bg-white p-3">
+      <p className="text-xs font-semibold text-[#4f6b4a]">{title}</p>
+      <AiLoadingBlock description={description} />
+    </section>
+  );
+}
+
+function AiLoadingBlock({ description }: { description: string }) {
+  return (
+    <div className="mt-3 space-y-3">
+      <div className="flex items-center gap-2 text-sm font-medium text-[#6c7568]">
+        <span className="h-2 w-2 animate-pulse rounded-full bg-[#4f6b4a]" />
+        <span>{description}</span>
+      </div>
+      <div className="space-y-2">
+        <span className="block h-3 w-11/12 animate-pulse rounded bg-[#e5eadf]" />
+        <span className="block h-3 w-8/12 animate-pulse rounded bg-[#e5eadf]" />
+      </div>
     </div>
   );
 }

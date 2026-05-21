@@ -1,4 +1,6 @@
-export const mockOverview = {
+import type { LearningOverview, SubtitleSegment } from "../types/learning";
+
+export const mockOverview: LearningOverview = {
   summary:
     "这支视频围绕 Claude Code 的高效使用展开，重点讨论环境配置、权限管理、上下文文件和工具联动等实践。它适合作为第一次搭建 AI 编程工作流时的操作参考。",
   chapters: [
@@ -38,7 +40,7 @@ export const mockOverview = {
       文档同步`
 };
 
-export const mockSubtitleSegments = [
+export const mockSubtitleSegments: SubtitleSegment[] = [
   {
     startTime: 12,
     endTime: 18,
