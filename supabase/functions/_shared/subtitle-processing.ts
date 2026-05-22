@@ -52,6 +52,25 @@ function splitIntoSentencePieces(segment: RawSubtitleSegment): RawSubtitleSegmen
   });
 }
 
+function trimOverlappingSubtitleEndTimes(segments: PreparedSubtitleSegment[]) {
+  return segments.map((segment, index) => {
+    const nextSegment = segments[index + 1];
+
+    if (
+      nextSegment &&
+      nextSegment.startTime > segment.startTime &&
+      nextSegment.startTime < segment.endTime
+    ) {
+      return {
+        ...segment,
+        endTime: nextSegment.startTime
+      };
+    }
+
+    return segment;
+  });
+}
+
 export function prepareSubtitleSegments(rawSegments: RawSubtitleSegment[]): PreparedSubtitleSegment[] {
   const pieces = rawSegments
     .slice()
@@ -110,7 +129,7 @@ export function prepareSubtitleSegments(rawSegments: RawSubtitleSegment[]): Prep
 
   flush();
 
-  return prepared;
+  return trimOverlappingSubtitleEndTimes(prepared);
 }
 
 export function prepareSubtitleTranslationBatches(rawSegments: RawSubtitleSegment[]): SubtitleTranslationBatch[] {

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 
 import { formatDuration } from "../src/utils/time.ts";
 import { isRetriableAiTaskError } from "../src/utils/ai-errors.ts";
+import { findActiveSubtitleIndex } from "../src/utils/subtitles.ts";
 import {
   getPendingBatchIndexes,
   mergeCompletedBatchResults,
@@ -9,6 +10,7 @@ import {
 } from "../src/utils/parse-checkpoint.ts";
 import { validateOverview } from "../supabase/functions/_shared/ai-schemas.ts";
 import {
+  prepareSubtitleSegments,
   prepareSubtitleTranslationBatches,
   SUBTITLE_TRANSLATION_BATCH_MAX_CHARACTERS,
   SUBTITLE_TRANSLATION_BATCH_MAX_SEGMENTS
@@ -48,6 +50,37 @@ assert.deepEqual(
   batches.flatMap((batch) => batch.segments.map((segment) => segment.index)),
   batches.flatMap((batch) => batch.segments).map((_, index) => index),
   "prepared segment indexes should be contiguous"
+);
+
+const overlappingPreparedSegments = prepareSubtitleSegments([
+  {
+    startTime: 341,
+    endTime: 356,
+    text: "And the reason why I even have this entire section is because it matters."
+  },
+  {
+    startTime: 354,
+    endTime: 360,
+    text: "So you should learn how to actually use most useful hotkeys."
+  }
+]);
+
+assert.equal(
+  overlappingPreparedSegments[0].endTime,
+  354,
+  "prepared subtitle end time should stop at the next subtitle start when timings overlap"
+);
+
+assert.equal(
+  findActiveSubtitleIndex(
+    [
+      { startTime: 341, endTime: 356, englishText: "previous", chineseText: "上一条" },
+      { startTime: 354, endTime: 360, englishText: "next", chineseText: "下一条" }
+    ],
+    354
+  ),
+  1,
+  "active subtitle should prefer the next subtitle once its start time is reached"
 );
 
 const outOfOrderMergedSegments = mergeCompletedBatchResults([

@@ -27,6 +27,7 @@ import {
   type CompletedBatchResult,
   type ParseCheckpoint
 } from "./utils/parse-checkpoint";
+import { findActiveSubtitleIndex } from "./utils/subtitles";
 import { formatDuration } from "./utils/time";
 
 type VideoInfo = {
@@ -3083,12 +3084,7 @@ function SubtitlesContent({
   onSeekToTime: (timeSeconds: number) => void;
   onSelectSubtitle: (selection: SelectedSubtitle) => void;
 }) {
-  const activeSubtitleIndex = subtitleSegments.findIndex(
-    (segment) =>
-      currentPlaybackTime !== null &&
-      currentPlaybackTime >= segment.startTime &&
-      currentPlaybackTime < segment.endTime
-  );
+  const activeSubtitleIndex = findActiveSubtitleIndex(subtitleSegments, currentPlaybackTime);
   const subtitleRefs = React.useRef<Record<number, HTMLElement | null>>({});
 
   React.useEffect(() => {
