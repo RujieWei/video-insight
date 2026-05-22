@@ -377,7 +377,7 @@ function publishPlaybackTime() {
     return;
   }
 
-  if (lastPlaybackTime !== null && Math.abs(playbackTime.currentTime - lastPlaybackTime) < 0.25) {
+  if (lastPlaybackTime !== null && Math.abs(playbackTime.currentTime - lastPlaybackTime) < 0.05) {
     return;
   }
 
@@ -392,4 +392,4 @@ publishVideoInfoIfChanged();
 window.addEventListener("yt-navigate-finish", publishVideoInfoIfChanged);
 window.addEventListener("popstate", publishVideoInfoIfChanged);
 setInterval(publishVideoInfoIfChanged, 1000);
-setInterval(publishPlaybackTime, 500);
+setInterval(publishPlaybackTime, 200);

@@ -25,19 +25,7 @@ export const mockOverview: LearningOverview = {
       summary: "结合现场问答讨论常见问题，并给出适合非工程背景用户的实践节奏。",
       keyPoints: ["先做可见结果再接复杂能力", "保持文档同步", "用小步验收建立信心"]
     }
-  ],
-  mindmapMermaid: `mindmap
-  root((Claude Code 实践))
-    环境配置
-      CLAUDE.md
-      项目规则
-    权限管理
-      工具调用
-      安全边界
-    Vibe Coding
-      小步推进
-      可见验收
-      文档同步`
+  ]
 };
 
 export const mockSubtitleSegments: SubtitleSegment[] = [

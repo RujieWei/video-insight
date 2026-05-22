@@ -60,7 +60,7 @@ export class DeepSeekProvider implements ModelProvider {
   async translateSubtitleBatch(batch: SubtitleTranslationBatch) {
     const payload = await this.callJson(
       "你是一个专业的英文视频字幕中文翻译助手。你必须只输出合法 JSON 对象。",
-      `请把输入字幕逐条翻译成自然中文。严格要求：不要新增、删除、合并、拆分字幕；必须保留每条字幕的 index；translations 数量必须等于输入数量；keywords 提取 0-3 个英文关键词。严格输出 JSON 对象，格式为 {"translations":[{"index":0,"chineseText":"...","keywords":["..."]}]}。\n\n输入字幕：\n${JSON.stringify(batch.segments.map((segment) => ({ index: segment.index, englishText: segment.englishText })))}`
+      `请把输入字幕逐条翻译成自然中文。严格要求：不要新增、删除、合并、拆分字幕；必须保留每条字幕的 index；translations 数量必须等于输入数量。严格输出 JSON 对象，格式为 {"translations":[{"index":0,"chineseText":"..."}]}。\n\n输入字幕：\n${JSON.stringify(batch.segments.map((segment) => ({ index: segment.index, englishText: segment.englishText })))}`
     );
     const translations = validateSubtitleTranslations(payload);
     const translationByIndex = new Map(translations.map((translation) => [translation.index, translation]));
@@ -85,7 +85,7 @@ export class DeepSeekProvider implements ModelProvider {
   async generateOverview(segments: GeneratedSubtitleSegment[]) {
     const payload = await this.callJson(
       "你是一个面向 AI 产品经理、创业者和科技从业者的视频内容分析助手。你必须只输出合法 JSON 对象。",
-      `请基于字幕生成中文学习总览。不要编造字幕之外的信息。严格输出 JSON 对象，格式为 {"overview":{"summary":"...","chapters":[{"title":"...","startTime":0,"endTime":300,"summary":"...","keyPoints":["..."]}],"timeline":[{"timeSeconds":0,"title":"...","description":"..."}],"mindmapMermaid":"mindmap\\n  root((...))"}}。\n\n字幕：\n${JSON.stringify(segments)}`
+      `请基于字幕生成中文学习总览。不要编造字幕之外的信息。严格输出 JSON 对象，格式为 {"overview":{"summary":"...","chapters":[{"title":"...","startTime":0,"endTime":300,"summary":"...","keyPoints":["..."]}],"timeline":[{"timeSeconds":0,"title":"...","description":"..."}]}}。\n\n字幕：\n${JSON.stringify(segments)}`
     );
 
     return validateOverview(payload);
@@ -107,7 +107,7 @@ export class DeepSeekProvider implements ModelProvider {
   async generateOverviewFromChunks(chunks: OverviewChunk[]) {
     const payload = await this.callJson(
       "你是一个面向 AI 产品经理、创业者和科技从业者的视频内容分析助手。你必须只输出合法 JSON 对象。",
-      `请基于视频分段摘要生成最终中文学习总览。不要编造分段摘要之外的信息。章节时间必须落在输入分段时间范围内。严格输出 JSON 对象，格式为 {"overview":{"summary":"...","chapters":[{"title":"...","startTime":0,"endTime":300,"summary":"...","keyPoints":["..."]}],"timeline":[{"timeSeconds":0,"title":"...","description":"..."}],"mindmapMermaid":"mindmap\\n  root((...))"}}。\n\n分段摘要：\n${JSON.stringify(chunks)}`
+      `请基于视频分段摘要生成最终中文学习总览。不要编造分段摘要之外的信息。章节时间必须落在输入分段时间范围内。严格输出 JSON 对象，格式为 {"overview":{"summary":"...","chapters":[{"title":"...","startTime":0,"endTime":300,"summary":"...","keyPoints":["..."]}],"timeline":[{"timeSeconds":0,"title":"...","description":"..."}]}}。\n\n分段摘要：\n${JSON.stringify(chunks)}`
     );
 
     return validateOverview(payload);

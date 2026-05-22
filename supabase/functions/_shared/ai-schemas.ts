@@ -32,7 +32,7 @@ export type GeneratedOverview = {
     title: string;
     description: string;
   }>;
-  mindmapMermaid: string;
+  mindmapMermaid?: string;
 };
 
 export type OverviewChunk = {
@@ -195,7 +195,10 @@ export function validateOverview(value: unknown): GeneratedOverview {
         description: assertString(item.description, `overview.timeline[${index}].description`)
       };
     }),
-    mindmapMermaid: assertString(overview.mindmapMermaid, "overview.mindmapMermaid")
+    mindmapMermaid:
+      typeof overview.mindmapMermaid === "string" && overview.mindmapMermaid.trim()
+        ? overview.mindmapMermaid
+        : undefined
   };
 }
 

@@ -149,7 +149,7 @@ Backend API
 ↓
 获取字幕
 ↓
-ModelProvider 处理字幕、摘要、章节、思维导图
+ModelProvider 处理字幕、摘要和章节
 ↓
 Supabase 保存结果
 ↓

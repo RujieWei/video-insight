@@ -174,7 +174,7 @@ async function upsertVideoAnalysis(videoDbId: string, overview: LearningOverview
       video_id: videoDbId,
       status: "completed",
       summary: analysisOverview.summary,
-      mindmap_mermaid: analysisOverview.mindmapMermaid,
+      mindmap_mermaid: analysisOverview.mindmapMermaid ?? null,
       language: "en",
       is_partial: false
     },

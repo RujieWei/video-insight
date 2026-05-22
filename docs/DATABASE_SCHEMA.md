@@ -122,7 +122,6 @@ segment_subtitles
 translate_subtitles
 generate_summary
 generate_chapters_timeline
-generate_mindmap
 save_results
 ```
 ---

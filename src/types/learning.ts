@@ -20,5 +20,5 @@ export type LearningOverview = {
     title: string;
     description: string;
   }>;
-  mindmapMermaid: string;
+  mindmapMermaid?: string;
 };

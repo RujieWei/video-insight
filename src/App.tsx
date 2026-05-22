@@ -19,6 +19,14 @@ import {
 } from "./services/supabase";
 import type { LearningOverview, SubtitleSegment } from "./types/learning";
 import { isRetriableAiTaskError } from "./utils/ai-errors";
+import {
+  getPendingBatchIndexes,
+  mergeCompletedBatchResults,
+  runSubtitleBatchQueue,
+  upsertCompletedBatchResult,
+  type CompletedBatchResult,
+  type ParseCheckpoint
+} from "./utils/parse-checkpoint";
 import { formatDuration } from "./utils/time";
 
 type VideoInfo = {
@@ -54,7 +62,7 @@ type LearningTab = {
 };
 
 type CloudSyncStatus = "idle" | "syncing" | "synced" | "error";
-type GenerationSource = "mock" | "ai" | "failed";
+type GenerationSource = "mock" | "ai" | "partial" | "failed";
 type ChatSource = "mock" | "ai" | "failed" | "loading";
 
 type PlaybackTimePayload = {
@@ -122,12 +130,16 @@ type StoredLearningState = {
   updatedAt: number;
 };
 
+type VideoParseCheckpoint = ParseCheckpoint<VideoInfo, SubtitleTranslationBatch>;
+
 const VIDEO_INFO_REQUEST = "VIDEO_INSIGHT_GET_VIDEO_INFO";
 const VIDEO_INFO_UPDATED = "VIDEO_INSIGHT_VIDEO_INFO_UPDATED";
 const PLAYBACK_TIME_UPDATED = "VIDEO_INSIGHT_PLAYBACK_TIME_UPDATED";
 const SEEK_TO_TIME = "VIDEO_INSIGHT_SEEK_TO_TIME";
 const ENGLISH_CAPTIONS_REQUEST = "VIDEO_INSIGHT_GET_ENGLISH_CAPTIONS";
 const STORAGE_KEY_PREFIX = "video-insight:learning:";
+const PARSE_CHECKPOINT_KEY_PREFIX = "video-insight:parse-checkpoint:";
+const SUBTITLE_TRANSLATION_CONCURRENCY = 3;
 
 const MOCK_PARSE_STEPS: ParseStep[] = [
   { key: "fetch_captions", label: "获取英文字幕" },
@@ -135,7 +147,6 @@ const MOCK_PARSE_STEPS: ParseStep[] = [
   { key: "translate_subtitles", label: "翻译中文字幕" },
   { key: "generate_summary", label: "生成整体摘要" },
   { key: "generate_chapters_timeline", label: "生成章节与时间轴" },
-  { key: "generate_mindmap", label: "生成 Mermaid 思维导图" },
   { key: "save_results", label: "保存解析结果" }
 ];
 
@@ -189,6 +200,10 @@ function getLearningStorageKey(videoId: string) {
   return `${STORAGE_KEY_PREFIX}${videoId}`;
 }
 
+function getParseCheckpointStorageKey(videoId: string) {
+  return `${PARSE_CHECKPOINT_KEY_PREFIX}${videoId}`;
+}
+
 function normalizeStoredLearningState(value: unknown): StoredLearningState | null {
   const maybeState = value as Partial<StoredLearningState> | undefined;
 
@@ -228,6 +243,58 @@ function loadStoredLearningState(videoId: string) {
 function saveStoredLearningState(videoId: string, state: StoredLearningState) {
   return new Promise<void>((resolve) => {
     chrome.storage.local.set({ [getLearningStorageKey(videoId)]: state }, () => {
+      resolve();
+    });
+  });
+}
+
+function normalizeParseCheckpoint(value: unknown): VideoParseCheckpoint | null {
+  const checkpoint = value as Partial<VideoParseCheckpoint> | undefined;
+
+  if (!checkpoint?.videoInfo?.videoId || !Array.isArray(checkpoint.batches)) {
+    return null;
+  }
+
+  return {
+    videoInfo: checkpoint.videoInfo,
+    batches: checkpoint.batches,
+    completedBatchResults: Array.isArray(checkpoint.completedBatchResults)
+      ? checkpoint.completedBatchResults
+      : [],
+    failedBatchIndexes: Array.isArray(checkpoint.failedBatchIndexes)
+      ? checkpoint.failedBatchIndexes.filter((index) => typeof index === "number")
+      : [],
+    status: checkpoint.status ?? "translating",
+    updatedAt: typeof checkpoint.updatedAt === "number" ? checkpoint.updatedAt : 0
+  };
+}
+
+function loadParseCheckpoint(videoId: string) {
+  return new Promise<VideoParseCheckpoint | null>((resolve) => {
+    const key = getParseCheckpointStorageKey(videoId);
+
+    chrome.storage.local.get(key, (result) => {
+      if (chrome.runtime.lastError) {
+        resolve(null);
+        return;
+      }
+
+      resolve(normalizeParseCheckpoint(result[key]));
+    });
+  });
+}
+
+function saveParseCheckpoint(videoId: string, checkpoint: VideoParseCheckpoint) {
+  return new Promise<void>((resolve) => {
+    chrome.storage.local.set({ [getParseCheckpointStorageKey(videoId)]: checkpoint }, () => {
+      resolve();
+    });
+  });
+}
+
+function removeParseCheckpoint(videoId: string) {
+  return new Promise<void>((resolve) => {
+    chrome.storage.local.remove(getParseCheckpointStorageKey(videoId), () => {
       resolve();
     });
   });
@@ -908,6 +975,10 @@ function getGenerationSourceLabel(source: GenerationSource) {
     return "生成失败";
   }
 
+  if (source === "partial") {
+    return "部分完成";
+  }
+
   return "Mock / 历史缓存";
 }
 
@@ -1067,6 +1138,7 @@ function App() {
   const [panelState, setPanelState] = React.useState<PanelState>({ status: "identifying" });
   const [parseStepStatuses, setParseStepStatuses] = React.useState(createInitialParseStepStatuses);
   const [parseProgressDetail, setParseProgressDetail] = React.useState("");
+  const [parseCheckpoint, setParseCheckpoint] = React.useState<VideoParseCheckpoint | null>(null);
   const [activeLearningTab, setActiveLearningTab] = React.useState<LearningTabKey>("overview");
   const [currentPlaybackTime, setCurrentPlaybackTime] = React.useState<number | null>(null);
   const [selectedSubtitle, setSelectedSubtitle] = React.useState<SelectedSubtitle | null>(null);
@@ -1142,6 +1214,10 @@ function App() {
   React.useEffect(() => {
     if (!learningVideoId) {
       suppressNextStorageSaveRef.current = false;
+      return;
+    }
+
+    if (subtitleSource === "partial") {
       return;
     }
 
@@ -1237,6 +1313,10 @@ function App() {
       return;
     }
 
+    if (subtitleSource === "partial") {
+      return;
+    }
+
     const timeoutId = window.setTimeout(() => {
       setCloudSyncStatus("syncing");
       setCloudSyncMessage("正在同步到 Supabase。");
@@ -1260,7 +1340,7 @@ function App() {
     return () => {
       window.clearTimeout(timeoutId);
     };
-  }, [authUser, learningVideoId, learningOverview, mockChatItems, mockNoteItems, mockVocabularyItems]);
+  }, [authUser, learningVideoId, learningOverview, subtitleSource, mockChatItems, mockNoteItems, mockVocabularyItems]);
 
   React.useEffect(() => {
     let disposed = false;
@@ -1274,6 +1354,7 @@ function App() {
       setActiveLearningTab("overview");
       setSelectedSubtitle(null);
       setParseProgressDetail("");
+      setParseCheckpoint(null);
       setLearningOverview(mockOverview);
       setSubtitleSegments(mockSubtitleSegments);
       setOverviewSource("mock");
@@ -1356,6 +1437,40 @@ function App() {
           setActiveLearningTab("overview");
           setPanelState({ status: "learning", videoInfo });
           return;
+        }
+
+        const storedParseCheckpoint = await loadParseCheckpoint(videoInfo.videoId);
+
+        if (disposed || recognizedVideoIdRef.current !== videoInfo.videoId) {
+          return;
+        }
+
+        if (storedParseCheckpoint) {
+          const checkpointSegments = mergeCompletedBatchResults(storedParseCheckpoint.completedBatchResults);
+          setParseCheckpoint(storedParseCheckpoint);
+          setSubtitleSegments(checkpointSegments);
+          setSubtitleSource(checkpointSegments.length > 0 ? "partial" : "mock");
+          setLearningOverview(null);
+          setOverviewSource("failed");
+          setOverviewGenerationFailed(checkpointSegments.length > 0);
+          setParseStepStatuses({
+            ...createInitialParseStepStatuses(),
+            fetch_captions: "completed",
+            segment_subtitles: checkpointSegments.length > 0 ? "completed" : "pending",
+            translate_subtitles:
+              storedParseCheckpoint.status === "completed"
+                ? "completed"
+                : storedParseCheckpoint.completedBatchResults.length > 0
+                  ? "failed"
+                  : "pending"
+          });
+
+          if (checkpointSegments.length > 0) {
+            learnedVideoIdRef.current = videoInfo.videoId;
+            setActiveLearningTab("subtitles");
+            setPanelState({ status: "learning", videoInfo });
+            return;
+          }
         }
 
         learnedVideoIdRef.current = null;
@@ -1477,24 +1592,29 @@ function App() {
     };
   }, []);
 
-  async function handleStartParsing(videoInfo: VideoInfo) {
+  async function handleStartParsing(
+    videoInfo: VideoInfo,
+    options: { resumeFromCheckpoint?: boolean } = {}
+  ) {
     if (!videoInfo.videoId) {
       return;
     }
 
+    const videoId = videoInfo.videoId;
     parseTimeoutIdsRef.current.forEach((timeoutId) => window.clearTimeout(timeoutId));
     parseTimeoutIdsRef.current = [];
     learnedVideoIdRef.current = null;
-    parsingVideoIdRef.current = videoInfo.videoId;
-    delete captionFailureByVideoIdRef.current[videoInfo.videoId];
+    parsingVideoIdRef.current = videoId;
+    delete captionFailureByVideoIdRef.current[videoId];
     setLearningOverview(null);
     setSubtitleSegments([]);
-    setOverviewSource("mock");
+    setOverviewSource("failed");
     setSubtitleSource("mock");
     setOverviewGenerationFailed(false);
     setVocabularyGenerationFailed(false);
     setVocabularyGenerating(false);
     setParseProgressDetail("");
+    setParseCheckpoint(null);
     setParseStepStatuses(createInitialParseStepStatuses());
     setPanelState({ status: "parsing", videoInfo });
 
@@ -1511,36 +1631,150 @@ function App() {
     }
 
     try {
-      setStepsStatus(["fetch_captions"], "processing");
-      const transcript = await fetchTranscriptWithCaptionProvider({
-        videoUrl: videoInfo.url,
-        videoId: videoInfo.videoId,
-        language: "en"
-      });
-      assertTranscriptCoverage(videoInfo, transcript.segments);
+      let checkpoint = options.resumeFromCheckpoint ? await loadParseCheckpoint(videoId) : null;
 
-      setStepsStatus(["fetch_captions"], "completed");
-      setStepsStatus(["segment_subtitles", "translate_subtitles"], "processing");
+      if (!checkpoint) {
+        if (!options.resumeFromCheckpoint) {
+          await removeParseCheckpoint(videoId);
+        }
 
-      setParseProgressDetail("正在重切分字幕并准备翻译批次。");
-      const translationBatches = await prepareSubtitleTranslationBatches(transcript.segments);
+        setStepsStatus(["fetch_captions"], "processing");
+        const transcript = await fetchTranscriptWithCaptionProvider({
+          videoUrl: videoInfo.url,
+          videoId,
+          language: "en"
+        });
+        assertTranscriptCoverage(videoInfo, transcript.segments);
+
+        setStepsStatus(["fetch_captions"], "completed");
+        setStepsStatus(["segment_subtitles", "translate_subtitles"], "processing");
+
+        setParseProgressDetail("正在重切分字幕并准备翻译批次。");
+        const translationBatches = await prepareSubtitleTranslationBatches(transcript.segments);
+
+        checkpoint = {
+          videoInfo,
+          batches: translationBatches,
+          completedBatchResults: [],
+          failedBatchIndexes: [],
+          status: "translating",
+          updatedAt: Date.now()
+        };
+        setParseCheckpoint(checkpoint);
+        await saveParseCheckpoint(videoId, checkpoint);
+      } else {
+        setParseCheckpoint(checkpoint);
+        setStepsStatus(["fetch_captions", "segment_subtitles"], "completed");
+        setStepsStatus(["translate_subtitles"], "processing");
+        const checkpointSegments = mergeCompletedBatchResults(checkpoint.completedBatchResults);
+        setSubtitleSegments(checkpointSegments);
+        setSubtitleSource(checkpointSegments.length > 0 ? "partial" : "mock");
+      }
+
+      const translationBatches = checkpoint.batches;
 
       if (translationBatches.length === 0) {
         throw new Error("当前视频无法解析：英文字幕内容为空。");
       }
 
-      const generatedSegments: SubtitleSegment[] = [];
+      let completedBatchResults: CompletedBatchResult[] = checkpoint.completedBatchResults;
+      const pendingBatchIndexes = getPendingBatchIndexes(
+        translationBatches,
+        checkpoint.completedBatchResults,
+        checkpoint.failedBatchIndexes
+      );
+      const pendingBatches = translationBatches.filter((batch) => pendingBatchIndexes.includes(batch.batchIndex));
+      let completedCount = completedBatchResults.length;
+      let failedBatchIndexes: number[] = [];
 
-      for (const batch of translationBatches) {
-        if (parsingVideoIdRef.current !== videoInfo.videoId) {
-          return;
-        }
+      setParseProgressDetail(
+        pendingBatches.length > 0
+          ? `字幕翻译：已完成 ${completedCount} / ${translationBatches.length} 批，并发 ${SUBTITLE_TRANSLATION_CONCURRENCY} 批处理中。`
+          : `字幕翻译：已完成 ${completedCount} / ${translationBatches.length} 批。`
+      );
 
-        setParseProgressDetail(`字幕翻译：已完成 ${batch.batchIndex} / ${translationBatches.length} 批。`);
-        generatedSegments.push(...await translateSubtitleBatchWithRetry(batch));
+      if (pendingBatches.length > 0) {
+        const queueResult = await runSubtitleBatchQueue({
+          batches: pendingBatches,
+          concurrency: SUBTITLE_TRANSLATION_CONCURRENCY,
+          initialCompletedBatchResults: completedBatchResults,
+          translateBatch: translateSubtitleBatchWithRetry,
+          onBatchComplete: async (result) => {
+            if (parsingVideoIdRef.current !== videoId) {
+              return;
+            }
+
+            completedBatchResults = upsertCompletedBatchResult(completedBatchResults, result);
+            completedCount = completedBatchResults.length;
+            const mergedSegments = mergeCompletedBatchResults(completedBatchResults);
+            const nextCheckpoint: VideoParseCheckpoint = {
+              videoInfo,
+              batches: translationBatches,
+              completedBatchResults,
+              failedBatchIndexes,
+              status: "translating",
+              updatedAt: Date.now()
+            };
+            setParseCheckpoint(nextCheckpoint);
+            setSubtitleSegments(mergedSegments);
+            setSubtitleSource("partial");
+            setParseProgressDetail(
+              `字幕翻译：已完成 ${completedCount} / ${translationBatches.length} 批，并发 ${SUBTITLE_TRANSLATION_CONCURRENCY} 批处理中。`
+            );
+            await saveParseCheckpoint(videoId, nextCheckpoint);
+          },
+          onBatchFailed: async (batchIndex) => {
+            failedBatchIndexes = [...new Set([...failedBatchIndexes, batchIndex])].sort((left, right) => left - right);
+            const nextCheckpoint: VideoParseCheckpoint = {
+              videoInfo,
+              batches: translationBatches,
+              completedBatchResults,
+              failedBatchIndexes,
+              status: completedBatchResults.length > 0 ? "partially_completed" : "failed",
+              updatedAt: Date.now()
+            };
+            setParseCheckpoint(nextCheckpoint);
+            await saveParseCheckpoint(videoId, nextCheckpoint);
+          }
+        });
+
+        completedBatchResults = queueResult.completedBatchResults;
+        failedBatchIndexes = queueResult.failedBatchIndexes;
       }
 
-      if (parsingVideoIdRef.current !== videoInfo.videoId) {
+      if (parsingVideoIdRef.current !== videoId) {
+        return;
+      }
+
+      const generatedSegments = mergeCompletedBatchResults(completedBatchResults);
+
+      if (generatedSegments.length === 0) {
+        throw new Error("字幕翻译失败：没有成功生成可用字幕，请稍后点击重新解析。");
+      }
+
+      if (failedBatchIndexes.length > 0 || completedBatchResults.length < translationBatches.length) {
+        const partialCheckpoint: VideoParseCheckpoint = {
+          videoInfo,
+          batches: translationBatches,
+          completedBatchResults,
+          failedBatchIndexes,
+          status: "partially_completed",
+          updatedAt: Date.now()
+        };
+        await saveParseCheckpoint(videoId, partialCheckpoint);
+        setParseCheckpoint(partialCheckpoint);
+        setParseProgressDetail("");
+        setSubtitleSegments(generatedSegments);
+        setSubtitleSource("partial");
+        setOverviewGenerationFailed(true);
+        setOverviewSource("failed");
+        setLearningOverview(null);
+        setStepsStatus(["segment_subtitles"], "completed");
+        setStepsStatus(["translate_subtitles"], "failed");
+        parsingVideoIdRef.current = null;
+        learnedVideoIdRef.current = videoId;
+        setActiveLearningTab("subtitles");
+        setPanelState({ status: "learning", videoInfo });
         return;
       }
 
@@ -1551,29 +1785,31 @@ function App() {
 
       try {
         setParseProgressDetail("正在生成视频总览。");
-        setStepsStatus(["generate_summary", "generate_chapters_timeline", "generate_mindmap"], "processing");
+        setStepsStatus(["generate_summary", "generate_chapters_timeline"], "processing");
         const generatedOverview = await generateOverviewForLongVideo(generatedSegments);
 
-        if (parsingVideoIdRef.current !== videoInfo.videoId) {
+        if (parsingVideoIdRef.current !== videoId) {
           return;
         }
 
         setLearningOverview(generatedOverview);
         setOverviewSource("ai");
-        setStepsStatus(["generate_summary", "generate_chapters_timeline", "generate_mindmap"], "completed");
+        setStepsStatus(["generate_summary", "generate_chapters_timeline"], "completed");
       } catch {
         setOverviewGenerationFailed(true);
         setOverviewSource("failed");
         setLearningOverview(null);
-        setStepsStatus(["generate_summary", "generate_chapters_timeline", "generate_mindmap"], "failed");
+        setStepsStatus(["generate_summary", "generate_chapters_timeline"], "failed");
       }
 
       setStepsStatus(["save_results"], "processing");
       setParseProgressDetail("正在保存解析结果。");
       setStepsStatus(["save_results"], "completed");
+      await removeParseCheckpoint(videoId);
+      setParseCheckpoint(null);
       setParseProgressDetail("");
       parsingVideoIdRef.current = null;
-      learnedVideoIdRef.current = videoInfo.videoId;
+      learnedVideoIdRef.current = videoId;
       setActiveLearningTab("overview");
       setPanelState({ status: "learning", videoInfo });
     } catch (error) {
@@ -1585,7 +1821,7 @@ function App() {
         error instanceof Error && error.message
           ? error.message
           : "没有成功获取当前视频的英文字幕。Video Insight MVP 暂只支持可获取英文字幕的视频。";
-      captionFailureByVideoIdRef.current[videoInfo.videoId] = failureDetail;
+      captionFailureByVideoIdRef.current[videoId] = failureDetail;
       setPanelState({
         status: "unparseable",
         reason: "当前视频无法解析",
@@ -1604,6 +1840,10 @@ function App() {
 
     await seekActiveTabToTime(activeTab.id, timeSeconds);
     setCurrentPlaybackTime(timeSeconds);
+  }
+
+  async function handleContinueParsing(videoInfo: VideoInfo) {
+    await handleStartParsing(videoInfo, { resumeFromCheckpoint: true });
   }
 
   async function handleCopySelectedSubtitle() {
@@ -1935,6 +2175,7 @@ function App() {
           panelState={panelState}
           parseStepStatuses={parseStepStatuses}
           parseProgressDetail={parseProgressDetail}
+          parseCheckpoint={parseCheckpoint}
           activeLearningTab={activeLearningTab}
           currentPlaybackTime={currentPlaybackTime}
           selectedSubtitle={selectedSubtitle}
@@ -1953,6 +2194,7 @@ function App() {
           onChatDraftChange={setChatDraft}
           onSendChatDraft={handleSendChatDraft}
           onStartParsing={handleStartParsing}
+          onContinueParsing={handleContinueParsing}
           onSeekToTime={handleSeekToTime}
           onSelectSubtitle={setSelectedSubtitle}
           onClearSelectedSubtitle={clearSelectedSubtitle}
@@ -2168,6 +2410,7 @@ function PanelContent({
   panelState,
   parseStepStatuses,
   parseProgressDetail,
+  parseCheckpoint,
   activeLearningTab,
   currentPlaybackTime,
   selectedSubtitle,
@@ -2186,6 +2429,7 @@ function PanelContent({
   onChatDraftChange,
   onSendChatDraft,
   onStartParsing,
+  onContinueParsing,
   onSeekToTime,
   onSelectSubtitle,
   onClearSelectedSubtitle,
@@ -2202,6 +2446,7 @@ function PanelContent({
   panelState: PanelState;
   parseStepStatuses: Record<string, ParseStepStatus>;
   parseProgressDetail: string;
+  parseCheckpoint: VideoParseCheckpoint | null;
   activeLearningTab: LearningTabKey;
   currentPlaybackTime: number | null;
   selectedSubtitle: SelectedSubtitle | null;
@@ -2220,6 +2465,7 @@ function PanelContent({
   onChatDraftChange: (draft: string) => void;
   onSendChatDraft: () => void | Promise<void>;
   onStartParsing: (videoInfo: VideoInfo) => void | Promise<void>;
+  onContinueParsing: (videoInfo: VideoInfo) => void | Promise<void>;
   onSeekToTime: (timeSeconds: number) => void;
   onSelectSubtitle: (selection: SelectedSubtitle) => void;
   onClearSelectedSubtitle: () => void;
@@ -2289,6 +2535,7 @@ function PanelContent({
         onChatDraftChange={onChatDraftChange}
         onSendChatDraft={onSendChatDraft}
         onStartParsing={onStartParsing}
+        onContinueParsing={onContinueParsing}
         onSeekToTime={onSeekToTime}
         onSelectSubtitle={onSelectSubtitle}
         onClearSelectedSubtitle={onClearSelectedSubtitle}
@@ -2305,7 +2552,14 @@ function PanelContent({
     );
   }
 
-  return <ReadyToParseCard videoInfo={panelState.videoInfo} onStartParsing={onStartParsing} />;
+  return (
+    <ReadyToParseCard
+      videoInfo={panelState.videoInfo}
+      parseCheckpoint={parseCheckpoint}
+      onStartParsing={onStartParsing}
+      onContinueParsing={onContinueParsing}
+    />
+  );
 }
 
 function StatusCard({
@@ -2344,24 +2598,49 @@ function StatusCard({
 
 function ReadyToParseCard({
   videoInfo,
-  onStartParsing
+  parseCheckpoint,
+  onStartParsing,
+  onContinueParsing
 }: {
   videoInfo: VideoInfo;
+  parseCheckpoint: VideoParseCheckpoint | null;
   onStartParsing: (videoInfo: VideoInfo) => void;
+  onContinueParsing: (videoInfo: VideoInfo) => void;
 }) {
+  const hasCheckpointForVideo = parseCheckpoint?.videoInfo.videoId === videoInfo.videoId;
+  const completedBatchCount = parseCheckpoint?.completedBatchResults.length ?? 0;
+  const totalBatchCount = parseCheckpoint?.batches.length ?? 0;
+
   return (
     <section className="rounded-lg border border-[#dfe4dc] bg-white/70 p-4 shadow-sm">
-      <p className="text-sm font-semibold text-[#4f6b4a]">当前视频可尝试解析</p>
+      <p className="text-sm font-semibold text-[#4f6b4a]">
+        {hasCheckpointForVideo ? "当前视频有未完成解析" : "当前视频可尝试解析"}
+      </p>
       <p className="mt-2 text-sm leading-6 text-[#6c7568]">
-        已读取视频基础信息。点击下方按钮后，会先获取英文字幕；如果无法获取，会显示无法解析。
+        {hasCheckpointForVideo
+          ? `已保留 ${completedBatchCount} / ${totalBatchCount} 个字幕批次。可以继续解析，也可以从头重新解析。`
+          : "已读取视频基础信息。点击下方按钮后，会先获取英文字幕；如果无法获取，会显示无法解析。"}
       </p>
       <VideoSummary videoInfo={videoInfo} />
+      {hasCheckpointForVideo ? (
+        <button
+          type="button"
+          className="mt-5 w-full rounded-md bg-[#20241f] px-4 py-3 text-sm font-semibold text-white transition hover:bg-[#343a31]"
+          onClick={() => onContinueParsing(videoInfo)}
+        >
+          继续解析
+        </button>
+      ) : null}
       <button
         type="button"
-        className="mt-5 w-full rounded-md bg-[#20241f] px-4 py-3 text-sm font-semibold text-white transition hover:bg-[#343a31]"
+        className={`w-full rounded-md px-4 py-3 text-sm font-semibold transition ${
+          hasCheckpointForVideo
+            ? "mt-3 border border-[#20241f] text-[#20241f] hover:bg-[#eef5e8]"
+            : "mt-5 bg-[#20241f] text-white hover:bg-[#343a31]"
+        }`}
         onClick={() => onStartParsing(videoInfo)}
       >
-        解析当前视频
+        {hasCheckpointForVideo ? "重新解析" : "解析当前视频"}
       </button>
     </section>
   );
@@ -2471,6 +2750,7 @@ function LearningView({
   onChatDraftChange,
   onSendChatDraft,
   onStartParsing,
+  onContinueParsing,
   onSeekToTime,
   onSelectSubtitle,
   onClearSelectedSubtitle,
@@ -2503,6 +2783,7 @@ function LearningView({
   onChatDraftChange: (draft: string) => void;
   onSendChatDraft: () => void | Promise<void>;
   onStartParsing: (videoInfo: VideoInfo) => void | Promise<void>;
+  onContinueParsing: (videoInfo: VideoInfo) => void | Promise<void>;
   onSeekToTime: (timeSeconds: number) => void;
   onSelectSubtitle: (selection: SelectedSubtitle) => void;
   onClearSelectedSubtitle: () => void;
@@ -2527,13 +2808,24 @@ function LearningView({
             字幕：{getGenerationSourceLabel(subtitleSource)} · 总览：{getGenerationSourceLabel(overviewSource)}
           </span>
         </div>
-        <button
-          type="button"
-          className="shrink-0 rounded-md border border-[#20241f] px-3 py-2 font-semibold text-[#20241f] transition hover:bg-[#eef5e8]"
-          onClick={() => onStartParsing(videoInfo)}
-        >
-          重新解析
-        </button>
+        <div className="flex shrink-0 gap-2">
+          {subtitleSource === "partial" ? (
+            <button
+              type="button"
+              className="rounded-md bg-[#20241f] px-3 py-2 font-semibold text-white transition hover:bg-[#343a31]"
+              onClick={() => onContinueParsing(videoInfo)}
+            >
+              继续解析
+            </button>
+          ) : null}
+          <button
+            type="button"
+            className="rounded-md border border-[#20241f] px-3 py-2 font-semibold text-[#20241f] transition hover:bg-[#eef5e8]"
+            onClick={() => onStartParsing(videoInfo)}
+          >
+            重新解析
+          </button>
+        </div>
       </section>
 
       <nav className="grid grid-cols-5 rounded-lg border border-[#dfe4dc] bg-white/70 p-1 shadow-sm">
@@ -2753,11 +3045,6 @@ function OverviewContent({
         </div>
       </GeneratedSection>
 
-      <GeneratedSection title="Mermaid 思维导图">
-        <pre className="overflow-auto rounded-md bg-[#20241f] p-3 text-xs leading-5 text-[#f7f8f5]">
-          <code>{overview.mindmapMermaid}</code>
-        </pre>
-      </GeneratedSection>
     </div>
   );
 }
@@ -2811,7 +3098,7 @@ function SubtitlesContent({
 
     subtitleRefs.current[activeSubtitleIndex]?.scrollIntoView({
       block: "center",
-      behavior: "smooth"
+      behavior: "auto"
     });
   }, [activeSubtitleIndex]);
 

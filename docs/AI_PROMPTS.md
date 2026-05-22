@@ -28,8 +28,7 @@
     "startTime": 12.3,
     "endTime": 18.6,
     "englishText": "...",
-    "chineseText": "...",
-    "keywords": ["...", "..."]
+    "chineseText": "..."
   }
 ]
 ```
@@ -45,7 +44,6 @@
 1. 整体摘要：用中文概括视频主要内容。
 2. 章节划分：根据内容自然划分章节，每章包含 title、startTime、endTime、summary、keyPoints。
 3. 时间轴：按时间顺序列出关键内容节点。
-4. Mermaid mindmap：生成可渲染的 Mermaid mindmap 代码。
 
 要求：
 - 不要编造视频中没有的信息。
@@ -53,7 +51,6 @@
 - 核心观点要有信息量，不要写空泛表达。
 - 如果视频涉及产品、AI、商业、技术观点，请优先提炼其可复用洞察。
 - 输出中文。
-- Mermaid 中的节点文字要简短。
 
 请严格输出 JSON：
 
@@ -74,8 +71,7 @@
       "title": "...",
       "description": "..."
     }
-  ],
-  "mindmapMermaid": "mindmap\n  root((...))\n    ..."
+  ]
 }
 ```
 

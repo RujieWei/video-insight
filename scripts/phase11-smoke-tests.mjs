@@ -3,6 +3,12 @@ import assert from "node:assert/strict";
 import { formatDuration } from "../src/utils/time.ts";
 import { isRetriableAiTaskError } from "../src/utils/ai-errors.ts";
 import {
+  getPendingBatchIndexes,
+  mergeCompletedBatchResults,
+  runSubtitleBatchQueue
+} from "../src/utils/parse-checkpoint.ts";
+import { validateOverview } from "../supabase/functions/_shared/ai-schemas.ts";
+import {
   prepareSubtitleTranslationBatches,
   SUBTITLE_TRANSLATION_BATCH_MAX_CHARACTERS,
   SUBTITLE_TRANSLATION_BATCH_MAX_SEGMENTS
@@ -43,5 +49,99 @@ assert.deepEqual(
   batches.flatMap((batch) => batch.segments).map((_, index) => index),
   "prepared segment indexes should be contiguous"
 );
+
+const outOfOrderMergedSegments = mergeCompletedBatchResults([
+  {
+    batchIndex: 2,
+    segments: [
+      { startTime: 20, endTime: 22, englishText: "third", chineseText: "第三句", keywords: [] }
+    ]
+  },
+  {
+    batchIndex: 0,
+    segments: [
+      { startTime: 0, endTime: 2, englishText: "first", chineseText: "第一句", keywords: [] }
+    ]
+  },
+  {
+    batchIndex: 1,
+    segments: [
+      { startTime: 10, endTime: 12, englishText: "second", chineseText: "第二句", keywords: [] }
+    ]
+  }
+]);
+
+assert.deepEqual(
+  outOfOrderMergedSegments.map((segment) => segment.englishText),
+  ["first", "second", "third"],
+  "completed batch results should merge by batchIndex"
+);
+
+assert.deepEqual(
+  getPendingBatchIndexes(
+    [{ batchIndex: 0, segments: [] }, { batchIndex: 1, segments: [] }, { batchIndex: 2, segments: [] }],
+    [{ batchIndex: 0, segments: [] }],
+    [2]
+  ),
+  [1, 2],
+  "checkpoint resume should continue missing and failed batches"
+);
+
+const queueEvents = [];
+const queueResult = await runSubtitleBatchQueue({
+  batches: [
+    { batchIndex: 0, segments: [] },
+    { batchIndex: 1, segments: [] },
+    { batchIndex: 2, segments: [] },
+    { batchIndex: 3, segments: [] }
+  ],
+  concurrency: 3,
+  translateBatch: async (batch) => {
+    if (batch.batchIndex === 2) {
+      throw new Error("生成失败（AI_TASK_FAILED）");
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, batch.batchIndex === 0 ? 20 : 1));
+
+    return [
+      {
+        startTime: batch.batchIndex,
+        endTime: batch.batchIndex + 1,
+        englishText: `batch-${batch.batchIndex}`,
+        chineseText: `批次-${batch.batchIndex}`,
+        keywords: []
+      }
+    ];
+  },
+  onBatchComplete: (result) => {
+    queueEvents.push(result.batchIndex);
+  }
+});
+
+assert.deepEqual(queueResult.failedBatchIndexes, [2], "failed batch should be recorded");
+assert.deepEqual(
+  mergeCompletedBatchResults(queueResult.completedBatchResults).map((segment) => segment.englishText),
+  ["batch-0", "batch-1", "batch-3"],
+  "successful concurrent batches should be retained when another batch fails"
+);
+assert.ok(Math.max(...queueEvents) > Math.min(...queueEvents), "queue should report completed batches");
+
+const overviewWithoutMindmap = validateOverview({
+  overview: {
+    summary: "这是一个总览。",
+    chapters: [
+      {
+        title: "章节",
+        startTime: 0,
+        endTime: 10,
+        summary: "章节摘要。",
+        keyPoints: ["关键点"]
+      }
+    ],
+    timeline: []
+  }
+});
+
+assert.equal(overviewWithoutMindmap.mindmapMermaid, undefined);
 
 console.log("Phase 11 smoke tests passed.");
