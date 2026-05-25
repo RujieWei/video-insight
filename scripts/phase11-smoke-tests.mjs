@@ -4,6 +4,11 @@ import { formatDuration } from "../src/utils/time.ts";
 import { isRetriableAiTaskError } from "../src/utils/ai-errors.ts";
 import { findActiveSubtitleIndex } from "../src/utils/subtitles.ts";
 import {
+  chunkOverviewSegments,
+  runOverviewChunkQueue,
+  toOverviewSourceSegments
+} from "../src/utils/overview.ts";
+import {
   getPendingBatchIndexes,
   mergeCompletedBatchResults,
   runSubtitleBatchQueue
@@ -159,6 +164,90 @@ assert.deepEqual(
 );
 assert.ok(Math.max(...queueEvents) > Math.min(...queueEvents), "queue should report completed batches");
 
+const overviewSourceSegments = toOverviewSourceSegments([
+  {
+    startTime: 0,
+    endTime: 3,
+    englishText: "Only the English text is needed for overview generation.",
+    chineseText: "总览生成只需要英文原文。",
+    keywords: ["overview"]
+  }
+]);
+
+assert.deepEqual(
+  overviewSourceSegments,
+  [
+    {
+      startTime: 0,
+      endTime: 3,
+      englishText: "Only the English text is needed for overview generation."
+    }
+  ],
+  "overview payload should strip chineseText and keywords"
+);
+
+const overviewChunks = chunkOverviewSegments(
+  Array.from({ length: 5 }, (_, index) => ({
+    startTime: index,
+    endTime: index + 1,
+    englishText: `overview segment ${index}`
+  })),
+  {
+    maxSegments: 2,
+    maxCharacters: 1000
+  }
+);
+
+assert.deepEqual(
+  overviewChunks.map((chunk) => chunk.segments.length),
+  [2, 2, 1],
+  "overview chunks should respect max segment count"
+);
+
+const overviewChunkResult = await runOverviewChunkQueue({
+  chunks: overviewChunks,
+  concurrency: 3,
+  generateChunk: async (chunk) => {
+    await new Promise((resolve) => setTimeout(resolve, chunk.chunkIndex === 0 ? 20 : 1));
+
+    return {
+      chunkIndex: chunk.chunkIndex,
+      startTime: chunk.segments[0].startTime,
+      endTime: chunk.segments.at(-1).endTime,
+      summary: `chunk ${chunk.chunkIndex}`,
+      keyPoints: [`point ${chunk.chunkIndex}`]
+    };
+  }
+});
+
+assert.deepEqual(
+  overviewChunkResult.map((chunk) => chunk.chunkIndex),
+  [0, 1, 2],
+  "overview chunk queue should return results sorted by chunkIndex"
+);
+
+await assert.rejects(
+  runOverviewChunkQueue({
+    chunks: overviewChunks,
+    concurrency: 3,
+    generateChunk: async (chunk) => {
+      if (chunk.chunkIndex === 1) {
+        throw new Error("chunk failed");
+      }
+
+      return {
+        chunkIndex: chunk.chunkIndex,
+        startTime: chunk.segments[0].startTime,
+        endTime: chunk.segments.at(-1).endTime,
+        summary: `chunk ${chunk.chunkIndex}`,
+        keyPoints: [`point ${chunk.chunkIndex}`]
+      };
+    }
+  }),
+  /chunk failed/,
+  "overview chunk queue should throw when any chunk fails"
+);
+
 const overviewWithoutMindmap = validateOverview({
   overview: {
     summary: "这是一个总览。",
@@ -170,11 +259,11 @@ const overviewWithoutMindmap = validateOverview({
         summary: "章节摘要。",
         keyPoints: ["关键点"]
       }
-    ],
-    timeline: []
+    ]
   }
 });
 
 assert.equal(overviewWithoutMindmap.mindmapMermaid, undefined);
+assert.equal(overviewWithoutMindmap.timeline, undefined);
 
 console.log("Phase 11 smoke tests passed.");

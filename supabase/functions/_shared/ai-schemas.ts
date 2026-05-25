@@ -12,6 +12,12 @@ export type GeneratedSubtitleSegment = {
   keywords: string[];
 };
 
+export type OverviewSubtitleSegment = {
+  startTime: number;
+  endTime: number;
+  englishText: string;
+};
+
 export type SubtitleTranslation = {
   index: number;
   chineseText: string;
@@ -27,7 +33,7 @@ export type GeneratedOverview = {
     summary: string;
     keyPoints: string[];
   }>;
-  timeline: Array<{
+  timeline?: Array<{
     timeSeconds: number;
     title: string;
     description: string;
@@ -169,10 +175,6 @@ export function validateOverview(value: unknown): GeneratedOverview {
     throw new InvalidModelOutputError("overview.chapters must be a non-empty array");
   }
 
-  if (!Array.isArray(timeline)) {
-    throw new InvalidModelOutputError("overview.timeline must be an array");
-  }
-
   return {
     summary: assertString(overview.summary, "overview.summary"),
     chapters: chapters.map((chapter, index) => {
@@ -186,15 +188,17 @@ export function validateOverview(value: unknown): GeneratedOverview {
         keyPoints: assertStringArray(item.keyPoints, `overview.chapters[${index}].keyPoints`)
       };
     }),
-    timeline: timeline.map((timelineItem, index) => {
-      const item = assertRecord(timelineItem, `overview.timeline[${index}]`);
+    timeline: Array.isArray(timeline)
+      ? timeline.map((timelineItem, index) => {
+          const item = assertRecord(timelineItem, `overview.timeline[${index}]`);
 
-      return {
-        timeSeconds: assertNumber(item.timeSeconds, `overview.timeline[${index}].timeSeconds`),
-        title: assertString(item.title, `overview.timeline[${index}].title`),
-        description: assertString(item.description, `overview.timeline[${index}].description`)
-      };
-    }),
+          return {
+            timeSeconds: assertNumber(item.timeSeconds, `overview.timeline[${index}].timeSeconds`),
+            title: assertString(item.title, `overview.timeline[${index}].title`),
+            description: assertString(item.description, `overview.timeline[${index}].description`)
+          };
+        })
+      : undefined,
     mindmapMermaid:
       typeof overview.mindmapMermaid === "string" && overview.mindmapMermaid.trim()
         ? overview.mindmapMermaid

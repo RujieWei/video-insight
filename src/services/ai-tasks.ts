@@ -1,4 +1,11 @@
 import type { LearningOverview, SubtitleSegment } from "../types/learning";
+import {
+  chunkOverviewSegments,
+  getOverviewCharacterCount,
+  runOverviewChunkQueue,
+  toOverviewSourceSegments,
+  type OverviewChunkResult
+} from "../utils/overview";
 import { supabase } from "./supabase";
 
 type AiTaskResponse<T> =
@@ -21,14 +28,6 @@ export type SubtitleTranslationBatch = {
   }>;
 };
 
-type OverviewChunk = {
-  chunkIndex: number;
-  startTime: number;
-  endTime: number;
-  summary: string;
-  keyPoints: string[];
-};
-
 type TranscriptResult = {
   provider: "supadata";
   mode: "native";
@@ -40,6 +39,7 @@ const OVERVIEW_SINGLE_CALL_MAX_SEGMENTS = 120;
 const OVERVIEW_SINGLE_CALL_MAX_CHARACTERS = 12000;
 const OVERVIEW_CHUNK_MAX_SEGMENTS = 70;
 const OVERVIEW_CHUNK_MAX_CHARACTERS = 7000;
+const OVERVIEW_CHUNK_CONCURRENCY = 3;
 
 async function invokeAiTask<T>(task: string, payload: Record<string, unknown>) {
   if (!supabase) {
@@ -81,45 +81,6 @@ async function invokeAiTask<T>(task: string, payload: Record<string, unknown>) {
   return data.data;
 }
 
-function getSubtitleCharacterCount(segments: SubtitleSegment[]) {
-  return segments.reduce((sum, segment) => sum + segment.englishText.length + segment.chineseText.length, 0);
-}
-
-function chunkOverviewSegments(segments: SubtitleSegment[]) {
-  const chunks: Array<{ chunkIndex: number; segments: SubtitleSegment[] }> = [];
-  let currentSegments: SubtitleSegment[] = [];
-  let currentLength = 0;
-
-  for (const segment of segments) {
-    const segmentLength = segment.englishText.length + segment.chineseText.length;
-    const nextLength = currentLength + segmentLength;
-
-    if (
-      currentSegments.length > 0 &&
-      (currentSegments.length >= OVERVIEW_CHUNK_MAX_SEGMENTS || nextLength > OVERVIEW_CHUNK_MAX_CHARACTERS)
-    ) {
-      chunks.push({
-        chunkIndex: chunks.length,
-        segments: currentSegments
-      });
-      currentSegments = [];
-      currentLength = 0;
-    }
-
-    currentSegments.push(segment);
-    currentLength += segmentLength;
-  }
-
-  if (currentSegments.length > 0) {
-    chunks.push({
-      chunkIndex: chunks.length,
-      segments: currentSegments
-    });
-  }
-
-  return chunks;
-}
-
 export async function segmentAndTranslateSubtitles(rawSegments: RawSubtitleSegment[]) {
   const result = await invokeAiTask<{ segments: SubtitleSegment[] }>("segmentAndTranslateSubtitles", {
     rawSegments
@@ -157,27 +118,39 @@ export async function fetchTranscriptWithCaptionProvider(input: {
 }
 
 export async function generateOverview(segments: SubtitleSegment[]) {
+  const overviewSegments = toOverviewSourceSegments(segments);
   const result = await invokeAiTask<{ overview: LearningOverview }>("generateOverview", {
-    segments
+    segments: overviewSegments
   });
 
   return result.overview;
 }
 
 export async function generateOverviewForLongVideo(segments: SubtitleSegment[]) {
+  const overviewSegments = toOverviewSourceSegments(segments);
+
   if (
-    segments.length <= OVERVIEW_SINGLE_CALL_MAX_SEGMENTS &&
-    getSubtitleCharacterCount(segments) <= OVERVIEW_SINGLE_CALL_MAX_CHARACTERS
+    overviewSegments.length <= OVERVIEW_SINGLE_CALL_MAX_SEGMENTS &&
+    getOverviewCharacterCount(overviewSegments) <= OVERVIEW_SINGLE_CALL_MAX_CHARACTERS
   ) {
-    return generateOverview(segments);
+    const result = await invokeAiTask<{ overview: LearningOverview }>("generateOverview", {
+      segments: overviewSegments
+    });
+
+    return result.overview;
   }
 
-  const chunks: OverviewChunk[] = [];
-
-  for (const chunkInput of chunkOverviewSegments(segments)) {
-    const result = await invokeAiTask<{ chunk: OverviewChunk }>("generateOverviewChunk", chunkInput);
-    chunks.push(result.chunk);
-  }
+  const chunks = await runOverviewChunkQueue({
+    chunks: chunkOverviewSegments(overviewSegments, {
+      maxSegments: OVERVIEW_CHUNK_MAX_SEGMENTS,
+      maxCharacters: OVERVIEW_CHUNK_MAX_CHARACTERS
+    }),
+    concurrency: OVERVIEW_CHUNK_CONCURRENCY,
+    generateChunk: async (chunkInput) => {
+      const result = await invokeAiTask<{ chunk: OverviewChunkResult }>("generateOverviewChunk", chunkInput);
+      return result.chunk;
+    }
+  });
 
   const result = await invokeAiTask<{ overview: LearningOverview }>("generateOverviewFromChunks", {
     chunks

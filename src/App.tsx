@@ -147,7 +147,7 @@ const MOCK_PARSE_STEPS: ParseStep[] = [
   { key: "segment_subtitles", label: "重切分字幕" },
   { key: "translate_subtitles", label: "翻译中文字幕" },
   { key: "generate_summary", label: "生成整体摘要" },
-  { key: "generate_chapters_timeline", label: "生成章节与时间轴" },
+  { key: "generate_chapters_timeline", label: "生成章节" },
   { key: "save_results", label: "保存解析结果" }
 ];
 

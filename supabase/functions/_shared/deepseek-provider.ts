@@ -10,6 +10,7 @@ import {
   type AnswerQuestionInput,
   type GenerateVocabularyItemInput,
   type GeneratedSubtitleSegment,
+  type OverviewSubtitleSegment,
   type OverviewChunk,
   type RawSubtitleSegment
 } from "./ai-schemas.ts";
@@ -82,10 +83,10 @@ export class DeepSeekProvider implements ModelProvider {
     });
   }
 
-  async generateOverview(segments: GeneratedSubtitleSegment[]) {
+  async generateOverview(segments: OverviewSubtitleSegment[]) {
     const payload = await this.callJson(
       "你是一个面向 AI 产品经理、创业者和科技从业者的视频内容分析助手。你必须只输出合法 JSON 对象。",
-      `请基于字幕生成中文学习总览。不要编造字幕之外的信息。严格输出 JSON 对象，格式为 {"overview":{"summary":"...","chapters":[{"title":"...","startTime":0,"endTime":300,"summary":"...","keyPoints":["..."]}],"timeline":[{"timeSeconds":0,"title":"...","description":"..."}]}}。\n\n字幕：\n${JSON.stringify(segments)}`
+      `请基于英文字幕生成中文学习总览。不要编造字幕之外的信息。摘要控制在 3-5 句；章节建议 5-8 个；每章 keyPoints 控制在 2-3 条。严格输出 JSON 对象，格式为 {"overview":{"summary":"...","chapters":[{"title":"...","startTime":0,"endTime":300,"summary":"...","keyPoints":["..."]}]}}。\n\n英文字幕：\n${JSON.stringify(segments)}`
     );
 
     return validateOverview(payload);
@@ -93,11 +94,11 @@ export class DeepSeekProvider implements ModelProvider {
 
   async generateOverviewChunk(input: {
     chunkIndex: number;
-    segments: GeneratedSubtitleSegment[];
+    segments: OverviewSubtitleSegment[];
   }) {
     const payload = await this.callJson(
       "你是一个面向 AI 产品经理、创业者和科技从业者的视频内容分析助手。你必须只输出合法 JSON 对象。",
-      `请基于这一段字幕生成中文分段摘要。不要编造字幕之外的信息。严格输出 JSON 对象，格式为 {"chunk":{"chunkIndex":0,"startTime":0,"endTime":300,"summary":"...","keyPoints":["..."]}}。\n\n输入：\n${JSON.stringify(input)}`,
+      `请基于这一段英文字幕生成中文分段摘要。不要编造字幕之外的信息。summary 控制在 2-3 句；keyPoints 控制在 2-3 条。严格输出 JSON 对象，格式为 {"chunk":{"chunkIndex":0,"startTime":0,"endTime":300,"summary":"...","keyPoints":["..."]}}。\n\n输入：\n${JSON.stringify(input)}`,
       1600
     );
 
@@ -107,7 +108,7 @@ export class DeepSeekProvider implements ModelProvider {
   async generateOverviewFromChunks(chunks: OverviewChunk[]) {
     const payload = await this.callJson(
       "你是一个面向 AI 产品经理、创业者和科技从业者的视频内容分析助手。你必须只输出合法 JSON 对象。",
-      `请基于视频分段摘要生成最终中文学习总览。不要编造分段摘要之外的信息。章节时间必须落在输入分段时间范围内。严格输出 JSON 对象，格式为 {"overview":{"summary":"...","chapters":[{"title":"...","startTime":0,"endTime":300,"summary":"...","keyPoints":["..."]}],"timeline":[{"timeSeconds":0,"title":"...","description":"..."}]}}。\n\n分段摘要：\n${JSON.stringify(chunks)}`
+      `请基于视频分段摘要生成最终中文学习总览。不要编造分段摘要之外的信息。摘要控制在 3-5 句；章节建议 5-8 个；每章 keyPoints 控制在 2-3 条；章节时间必须落在输入分段时间范围内。严格输出 JSON 对象，格式为 {"overview":{"summary":"...","chapters":[{"title":"...","startTime":0,"endTime":300,"summary":"...","keyPoints":["..."]}]}}。\n\n分段摘要：\n${JSON.stringify(chunks)}`
     );
 
     return validateOverview(payload);
