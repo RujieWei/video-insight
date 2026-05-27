@@ -4,6 +4,11 @@ import { formatDuration } from "../src/utils/time.ts";
 import { isRetriableAiTaskError } from "../src/utils/ai-errors.ts";
 import { findActiveSubtitleIndex } from "../src/utils/subtitles.ts";
 import {
+  getParseDisplayProgress,
+  getParseDisplaySteps,
+  getNonDecreasingProgress
+} from "../src/utils/parse-progress.ts";
+import {
   chunkOverviewSegments,
   runOverviewChunkQueue,
   toOverviewSourceSegments
@@ -250,6 +255,7 @@ await assert.rejects(
 
 const overviewWithoutMindmap = validateOverview({
   overview: {
+    titleZh: "中文标题",
     summary: "这是一个总览。",
     chapters: [
       {
@@ -265,5 +271,61 @@ const overviewWithoutMindmap = validateOverview({
 
 assert.equal(overviewWithoutMindmap.mindmapMermaid, undefined);
 assert.equal(overviewWithoutMindmap.timeline, undefined);
+assert.equal(overviewWithoutMindmap.titleZh, "中文标题");
+
+const overviewWithoutTitle = validateOverview({
+  overview: {
+    summary: "这是一个旧总览。",
+    chapters: [
+      {
+        title: "旧章节",
+        startTime: 0,
+        endTime: 10,
+        summary: "旧章节摘要。",
+        keyPoints: ["关键点"]
+      }
+    ]
+  }
+});
+
+assert.equal(overviewWithoutTitle.titleZh, undefined);
+
+const parseProgressStatuses = {
+  fetch_captions: "completed",
+  segment_subtitles: "completed",
+  translate_subtitles: "processing",
+  generate_summary: "pending",
+  generate_chapters_timeline: "pending",
+  save_results: "pending"
+};
+
+assert.deepEqual(
+  getParseDisplaySteps(parseProgressStatuses).map((step) => [step.label, step.status]),
+  [
+    ["获取字幕", "completed"],
+    ["翻译字幕", "processing"],
+    ["生成总览", "pending"],
+    ["保存结果", "pending"]
+  ],
+  "parse display steps should aggregate internal technical steps"
+);
+
+assert.equal(
+  getParseDisplayProgress(parseProgressStatuses, { completed: 5, total: 10 }),
+  45,
+  "parse progress should map subtitle batch progress into the weighted progress bar"
+);
+
+assert.equal(
+  getNonDecreasingProgress(61, 45),
+  61,
+  "parse progress should never move backward in the UI"
+);
+
+assert.equal(
+  getNonDecreasingProgress(61, 82),
+  82,
+  "parse progress should keep moving forward when new progress is higher"
+);
 
 console.log("Phase 11 smoke tests passed.");

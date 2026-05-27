@@ -7,6 +7,7 @@ export type SubtitleSegment = {
 };
 
 export type LearningOverview = {
+  titleZh?: string;
   summary: string;
   chapters: Array<{
     title: string;

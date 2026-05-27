@@ -25,6 +25,7 @@ export type SubtitleTranslation = {
 };
 
 export type GeneratedOverview = {
+  titleZh?: string;
   summary: string;
   chapters: Array<{
     title: string;
@@ -176,6 +177,10 @@ export function validateOverview(value: unknown): GeneratedOverview {
   }
 
   return {
+    titleZh:
+      typeof overview.titleZh === "string" && overview.titleZh.trim()
+        ? overview.titleZh
+        : undefined,
     summary: assertString(overview.summary, "overview.summary"),
     chapters: chapters.map((chapter, index) => {
       const item = assertRecord(chapter, `overview.chapters[${index}]`);

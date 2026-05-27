@@ -79,7 +79,7 @@ serve(async (request) => {
     }
 
     if (task === "generateOverview") {
-      const overview = await provider.generateOverview(payload.segments);
+      const overview = await provider.generateOverview(payload.segments, payload.videoTitle);
       return jsonResponse({ ok: true, data: { overview } });
     }
 
@@ -89,7 +89,7 @@ serve(async (request) => {
     }
 
     if (task === "generateOverviewFromChunks") {
-      const overview = await provider.generateOverviewFromChunks(payload.chunks);
+      const overview = await provider.generateOverviewFromChunks(payload.chunks, payload.videoTitle);
       return jsonResponse({ ok: true, data: { overview } });
     }
 

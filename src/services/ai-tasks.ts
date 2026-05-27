@@ -117,16 +117,17 @@ export async function fetchTranscriptWithCaptionProvider(input: {
   return result.transcript;
 }
 
-export async function generateOverview(segments: SubtitleSegment[]) {
+export async function generateOverview(segments: SubtitleSegment[], videoTitle?: string) {
   const overviewSegments = toOverviewSourceSegments(segments);
   const result = await invokeAiTask<{ overview: LearningOverview }>("generateOverview", {
-    segments: overviewSegments
+    segments: overviewSegments,
+    videoTitle
   });
 
   return result.overview;
 }
 
-export async function generateOverviewForLongVideo(segments: SubtitleSegment[]) {
+export async function generateOverviewForLongVideo(segments: SubtitleSegment[], videoTitle?: string) {
   const overviewSegments = toOverviewSourceSegments(segments);
 
   if (
@@ -134,7 +135,8 @@ export async function generateOverviewForLongVideo(segments: SubtitleSegment[]) 
     getOverviewCharacterCount(overviewSegments) <= OVERVIEW_SINGLE_CALL_MAX_CHARACTERS
   ) {
     const result = await invokeAiTask<{ overview: LearningOverview }>("generateOverview", {
-      segments: overviewSegments
+      segments: overviewSegments,
+      videoTitle
     });
 
     return result.overview;
@@ -153,7 +155,8 @@ export async function generateOverviewForLongVideo(segments: SubtitleSegment[]) 
   });
 
   const result = await invokeAiTask<{ overview: LearningOverview }>("generateOverviewFromChunks", {
-    chunks
+    chunks,
+    videoTitle
   });
 
   return result.overview;

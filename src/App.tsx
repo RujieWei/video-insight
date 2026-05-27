@@ -27,6 +27,12 @@ import {
   type CompletedBatchResult,
   type ParseCheckpoint
 } from "./utils/parse-checkpoint";
+import {
+  getNonDecreasingProgress,
+  getParseDisplayProgress,
+  getParseDisplaySteps,
+  type TranslationProgress
+} from "./utils/parse-progress";
 import { findActiveSubtitleIndex } from "./utils/subtitles";
 import { formatDuration } from "./utils/time";
 
@@ -1138,7 +1144,7 @@ async function translateSubtitleBatchWithRetry(batch: SubtitleTranslationBatch) 
 function App() {
   const [panelState, setPanelState] = React.useState<PanelState>({ status: "identifying" });
   const [parseStepStatuses, setParseStepStatuses] = React.useState(createInitialParseStepStatuses);
-  const [parseProgressDetail, setParseProgressDetail] = React.useState("");
+  const [translationProgress, setTranslationProgress] = React.useState<TranslationProgress | null>(null);
   const [parseCheckpoint, setParseCheckpoint] = React.useState<VideoParseCheckpoint | null>(null);
   const [activeLearningTab, setActiveLearningTab] = React.useState<LearningTabKey>("overview");
   const [currentPlaybackTime, setCurrentPlaybackTime] = React.useState<number | null>(null);
@@ -1330,7 +1336,7 @@ function App() {
       })
         .then(() => {
           setCloudSyncStatus("synced");
-          setCloudSyncMessage("已同步到 Supabase。");
+          setCloudSyncMessage("已同步");
         })
         .catch(() => {
           setCloudSyncStatus("error");
@@ -1354,7 +1360,7 @@ function App() {
     function resetLearningDataForCurrentVideo() {
       setActiveLearningTab("overview");
       setSelectedSubtitle(null);
-      setParseProgressDetail("");
+      setTranslationProgress(null);
       setParseCheckpoint(null);
       setLearningOverview(mockOverview);
       setSubtitleSegments(mockSubtitleSegments);
@@ -1426,6 +1432,7 @@ function App() {
 
         if (storedLearningState) {
           learnedVideoIdRef.current = videoInfo.videoId;
+          setTranslationProgress(null);
           setParseStepStatuses(createCompletedParseStepStatuses());
           setLearningOverview(storedLearningState.overview ?? mockOverview);
           setSubtitleSegments(storedLearningState.subtitleSegments ?? mockSubtitleSegments);
@@ -1448,6 +1455,10 @@ function App() {
 
         if (storedParseCheckpoint) {
           const checkpointSegments = mergeCompletedBatchResults(storedParseCheckpoint.completedBatchResults);
+          setTranslationProgress({
+            completed: storedParseCheckpoint.completedBatchResults.length,
+            total: storedParseCheckpoint.batches.length
+          });
           setParseCheckpoint(storedParseCheckpoint);
           setSubtitleSegments(checkpointSegments);
           setSubtitleSource(checkpointSegments.length > 0 ? "partial" : "mock");
@@ -1475,6 +1486,7 @@ function App() {
         }
 
         learnedVideoIdRef.current = null;
+        setTranslationProgress(null);
         setParseStepStatuses(createInitialParseStepStatuses());
         setPanelState(getVideoPageState(videoInfo, parsingVideoIdRef.current, learnedVideoIdRef.current));
         return;
@@ -1614,7 +1626,7 @@ function App() {
     setOverviewGenerationFailed(false);
     setVocabularyGenerationFailed(false);
     setVocabularyGenerating(false);
-    setParseProgressDetail("");
+    setTranslationProgress(null);
     setParseCheckpoint(null);
     setParseStepStatuses(createInitialParseStepStatuses());
     setPanelState({ status: "parsing", videoInfo });
@@ -1650,8 +1662,8 @@ function App() {
         setStepsStatus(["fetch_captions"], "completed");
         setStepsStatus(["segment_subtitles", "translate_subtitles"], "processing");
 
-        setParseProgressDetail("正在重切分字幕并准备翻译批次。");
         const translationBatches = await prepareSubtitleTranslationBatches(transcript.segments);
+        setTranslationProgress({ completed: 0, total: translationBatches.length });
 
         checkpoint = {
           videoInfo,
@@ -1668,6 +1680,10 @@ function App() {
         setStepsStatus(["fetch_captions", "segment_subtitles"], "completed");
         setStepsStatus(["translate_subtitles"], "processing");
         const checkpointSegments = mergeCompletedBatchResults(checkpoint.completedBatchResults);
+        setTranslationProgress({
+          completed: checkpoint.completedBatchResults.length,
+          total: checkpoint.batches.length
+        });
         setSubtitleSegments(checkpointSegments);
         setSubtitleSource(checkpointSegments.length > 0 ? "partial" : "mock");
       }
@@ -1687,12 +1703,7 @@ function App() {
       const pendingBatches = translationBatches.filter((batch) => pendingBatchIndexes.includes(batch.batchIndex));
       let completedCount = completedBatchResults.length;
       let failedBatchIndexes: number[] = [];
-
-      setParseProgressDetail(
-        pendingBatches.length > 0
-          ? `字幕翻译：已完成 ${completedCount} / ${translationBatches.length} 批，并发 ${SUBTITLE_TRANSLATION_CONCURRENCY} 批处理中。`
-          : `字幕翻译：已完成 ${completedCount} / ${translationBatches.length} 批。`
-      );
+      setTranslationProgress({ completed: completedCount, total: translationBatches.length });
 
       if (pendingBatches.length > 0) {
         const queueResult = await runSubtitleBatchQueue({
@@ -1707,6 +1718,7 @@ function App() {
 
             completedBatchResults = upsertCompletedBatchResult(completedBatchResults, result);
             completedCount = completedBatchResults.length;
+            setTranslationProgress({ completed: completedCount, total: translationBatches.length });
             const mergedSegments = mergeCompletedBatchResults(completedBatchResults);
             const nextCheckpoint: VideoParseCheckpoint = {
               videoInfo,
@@ -1719,9 +1731,6 @@ function App() {
             setParseCheckpoint(nextCheckpoint);
             setSubtitleSegments(mergedSegments);
             setSubtitleSource("partial");
-            setParseProgressDetail(
-              `字幕翻译：已完成 ${completedCount} / ${translationBatches.length} 批，并发 ${SUBTITLE_TRANSLATION_CONCURRENCY} 批处理中。`
-            );
             await saveParseCheckpoint(videoId, nextCheckpoint);
           },
           onBatchFailed: async (batchIndex) => {
@@ -1764,7 +1773,7 @@ function App() {
         };
         await saveParseCheckpoint(videoId, partialCheckpoint);
         setParseCheckpoint(partialCheckpoint);
-        setParseProgressDetail("");
+        setTranslationProgress({ completed: completedBatchResults.length, total: translationBatches.length });
         setSubtitleSegments(generatedSegments);
         setSubtitleSource("partial");
         setOverviewGenerationFailed(true);
@@ -1779,15 +1788,14 @@ function App() {
         return;
       }
 
-      setParseProgressDetail(`字幕翻译：已完成 ${translationBatches.length} / ${translationBatches.length} 批。`);
+      setTranslationProgress({ completed: translationBatches.length, total: translationBatches.length });
       setSubtitleSegments(generatedSegments);
       setSubtitleSource("ai");
       setStepsStatus(["segment_subtitles", "translate_subtitles"], "completed");
 
       try {
-        setParseProgressDetail("正在生成视频总览。");
         setStepsStatus(["generate_summary", "generate_chapters_timeline"], "processing");
-        const generatedOverview = await generateOverviewForLongVideo(generatedSegments);
+        const generatedOverview = await generateOverviewForLongVideo(generatedSegments, videoInfo.title);
 
         if (parsingVideoIdRef.current !== videoId) {
           return;
@@ -1804,18 +1812,17 @@ function App() {
       }
 
       setStepsStatus(["save_results"], "processing");
-      setParseProgressDetail("正在保存解析结果。");
       setStepsStatus(["save_results"], "completed");
       await removeParseCheckpoint(videoId);
       setParseCheckpoint(null);
-      setParseProgressDetail("");
+      setTranslationProgress(null);
       parsingVideoIdRef.current = null;
       learnedVideoIdRef.current = videoId;
       setActiveLearningTab("overview");
       setPanelState({ status: "learning", videoInfo });
     } catch (error) {
       parsingVideoIdRef.current = null;
-      setParseProgressDetail("");
+      setTranslationProgress(null);
       setSubtitleSource("failed");
       setStepsStatus(["fetch_captions", "segment_subtitles", "translate_subtitles"], "failed");
       const failureDetail =
@@ -2152,13 +2159,8 @@ function App() {
   }
 
   return (
-    <main className="min-h-screen bg-[#f7f8f5] px-5 py-6 text-[#20241f]">
-      <section className="flex min-h-[calc(100vh-3rem)] flex-col gap-6">
-        <header>
-          <p className="text-xs font-medium uppercase tracking-[0.18em] text-[#6c7568]">Video Insight</p>
-          <h1 className="mt-5 text-2xl font-semibold leading-tight">当前视频学习</h1>
-        </header>
-
+    <main className="h-screen overflow-hidden bg-[#f7f8f5] px-4 py-3 text-[#20241f]">
+      <section className="flex h-full min-h-0 flex-col gap-3">
         <CloudAuthPanel
           user={authUser}
           isConfigured={isSupabaseConfigured}
@@ -2175,7 +2177,7 @@ function App() {
         <PanelContent
           panelState={panelState}
           parseStepStatuses={parseStepStatuses}
-          parseProgressDetail={parseProgressDetail}
+          translationProgress={translationProgress}
           parseCheckpoint={parseCheckpoint}
           activeLearningTab={activeLearningTab}
           currentPlaybackTime={currentPlaybackTime}
@@ -2210,9 +2212,6 @@ function App() {
           onSaveNote={handleSaveNote}
         />
 
-        <p className="mt-auto text-sm leading-6 text-[#6c7568]">
-          Phase 11 使用当前 YouTube 页面中的英文字幕轨作为解析输入。无可获取英文字幕的视频会显示无法解析。
-        </p>
       </section>
     </main>
   );
@@ -2245,7 +2244,13 @@ function CloudAuthPanel({
   const [otpToken, setOtpToken] = React.useState("");
   const [otpEmail, setOtpEmail] = React.useState("");
   const [resendCountdown, setResendCountdown] = React.useState(0);
-  const statusText = getCloudSyncStatusText(cloudSyncStatus, cloudSyncMessage);
+  const [isExpanded, setIsExpanded] = React.useState(false);
+  const syncStatus = getCloudSyncStatusMeta({
+    isConfigured,
+    isLoggedIn: Boolean(user),
+    status: cloudSyncStatus,
+    message: cloudSyncMessage
+  });
 
   React.useEffect(() => {
     if (resendCountdown <= 0) {
@@ -2303,114 +2308,158 @@ function CloudAuthPanel({
     }
   }
 
-  if (!isConfigured) {
-    return (
-      <section className="rounded-lg border border-[#ead8b7] bg-[#fffaf0] p-4 shadow-sm">
-        <p className="text-sm font-semibold text-[#9a5a2f]">Supabase 未配置</p>
-        <p className="mt-2 text-sm leading-6 text-[#6c7568]">
-          本轮只创建了 .env.example。后续创建本地 .env 并填入 Supabase URL 和 anon key 后，登录和云端同步会启用。
-        </p>
-      </section>
-    );
-  }
-
-  if (user) {
-    return (
-      <section className="rounded-lg border border-[#dfe4dc] bg-white/70 p-4 shadow-sm">
-        <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <p className="text-sm font-semibold text-[#4f6b4a]">已登录</p>
-            <p className="mt-1 break-words text-sm leading-6 text-[#20241f]">{user.email}</p>
-            {statusText ? <p className="mt-1 text-xs leading-5 text-[#6c7568]">{statusText}</p> : null}
-          </div>
-          <button
-            type="button"
-            className="shrink-0 rounded-md border border-[#dfe4dc] px-3 py-2 text-xs font-semibold hover:border-[#4f6b4a] hover:bg-[#eef5e8]"
-            disabled={isLoading}
-            onClick={onSignOut}
-          >
-            退出
-          </button>
-        </div>
-      </section>
-    );
-  }
-
-  return (
-    <section className="rounded-lg border border-[#dfe4dc] bg-white/70 p-4 shadow-sm">
-      <p className="text-sm font-semibold text-[#4f6b4a]">登录后同步学习记录</p>
-      <div className="mt-3 flex gap-2">
-        <input
-          className="min-w-0 flex-1 rounded-md border border-[#dfe4dc] bg-[#fbfcf8] px-3 py-2 text-sm outline-none focus:border-[#4f6b4a]"
-          type="email"
-          placeholder="输入邮箱"
-          value={email}
-          onChange={(event) => handleEmailChange(event.target.value)}
-        />
+  const accountControl = !isConfigured ? (
+    <span className="px-1 text-[11px] font-normal text-[#8a9385]">
+      未启用同步
+    </span>
+  ) : user ? (
+    <div className="relative">
         <button
           type="button"
-          className="shrink-0 rounded-md bg-[#20241f] px-3 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:bg-[#c4cabc]"
-          disabled={isLoading || resendCountdown > 0 || !email.trim()}
-          onClick={handleSendOtp}
+          className="rounded-full px-1 py-0.5 text-[11px] font-normal text-[#8a9385] transition hover:bg-[#eef2ea] hover:text-[#20241f]"
+          onClick={() => setIsExpanded((current) => !current)}
         >
-          {isLoading ? "发送中" : resendCountdown > 0 ? `${resendCountdown}s` : "发送验证码"}
+          {user.email || "账号"}
         </button>
-      </div>
-      {otpEmail ? (
-        <>
+        {isExpanded ? (
+          <section className="absolute right-0 top-9 z-20 w-72 rounded-lg border border-[#dfe4dc] bg-white p-3 shadow-lg">
+            <p className="text-xs font-semibold text-[#4f6b4a]">我的账号</p>
+            <p className="mt-2 break-words text-sm leading-5 text-[#20241f]">{user.email}</p>
+            {authMessage ? <p className="mt-2 text-xs leading-5 text-[#4f6b4a]">{authMessage}</p> : null}
+            {authError ? <p className="mt-2 text-xs leading-5 text-[#b5533f]">{authError}</p> : null}
+            <button
+              type="button"
+              className="mt-3 w-full rounded-md border border-[#dfe4dc] px-3 py-2 text-xs font-semibold text-[#20241f] hover:border-[#4f6b4a] hover:bg-[#eef5e8]"
+              disabled={isLoading}
+              onClick={onSignOut}
+            >
+              退出登录
+            </button>
+          </section>
+        ) : null}
+    </div>
+  ) : (
+    <div className="relative">
+      <button
+        type="button"
+        className="rounded-full px-1 py-0.5 text-[11px] font-normal text-[#8a9385] transition hover:bg-[#eef2ea] hover:text-[#20241f]"
+        onClick={() => setIsExpanded((current) => !current)}
+      >
+        登录同步
+      </button>
+      {isExpanded ? (
+        <section className="absolute right-0 top-9 z-20 w-80 rounded-lg border border-[#dfe4dc] bg-white p-3 shadow-lg">
+          <p className="text-sm font-semibold text-[#4f6b4a]">同步学习记录</p>
           <div className="mt-3 flex gap-2">
             <input
               className="min-w-0 flex-1 rounded-md border border-[#dfe4dc] bg-[#fbfcf8] px-3 py-2 text-sm outline-none focus:border-[#4f6b4a]"
-              inputMode="numeric"
-            maxLength={8}
-            placeholder="输入 8 位验证码"
-            value={otpToken}
-            onChange={(event) => setOtpToken(event.target.value.replace(/\D/g, "").slice(0, 8))}
-          />
+              type="email"
+              placeholder="输入邮箱"
+              value={email}
+              onChange={(event) => handleEmailChange(event.target.value)}
+            />
             <button
               type="button"
-              className="shrink-0 rounded-md border border-[#20241f] px-3 py-2 text-sm font-semibold text-[#20241f] disabled:cursor-not-allowed disabled:border-[#c4cabc] disabled:text-[#9aa392]"
-              disabled={isLoading || otpToken.trim().length !== 8}
-              onClick={handleVerifyOtp}
+              className="shrink-0 rounded-md bg-[#20241f] px-3 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:bg-[#c4cabc]"
+              disabled={isLoading || resendCountdown > 0 || !email.trim()}
+              onClick={handleSendOtp}
             >
-              验证登录
+              {isLoading ? "发送中" : resendCountdown > 0 ? `${resendCountdown}s` : "发送验证码"}
             </button>
           </div>
-          <p className="mt-2 text-xs leading-5 text-[#6c7568]">
-            验证码已发送到 {otpEmail}。没有收到时，请等倒计时结束后再重发。
-          </p>
-        </>
+          {otpEmail ? (
+            <>
+              <div className="mt-3 flex gap-2">
+                <input
+                  className="min-w-0 flex-1 rounded-md border border-[#dfe4dc] bg-[#fbfcf8] px-3 py-2 text-sm outline-none focus:border-[#4f6b4a]"
+                  inputMode="numeric"
+                  maxLength={8}
+                  placeholder="输入 8 位验证码"
+                  value={otpToken}
+                  onChange={(event) => setOtpToken(event.target.value.replace(/\D/g, "").slice(0, 8))}
+                />
+                <button
+                  type="button"
+                  className="shrink-0 rounded-md border border-[#20241f] px-3 py-2 text-sm font-semibold text-[#20241f] disabled:cursor-not-allowed disabled:border-[#c4cabc] disabled:text-[#9aa392]"
+                  disabled={isLoading || otpToken.trim().length !== 8}
+                  onClick={handleVerifyOtp}
+                >
+                  验证
+                </button>
+              </div>
+              <p className="mt-2 text-xs leading-5 text-[#6c7568]">
+                验证码已发送到 {otpEmail}。没有收到时，请等倒计时结束后再重发。
+              </p>
+            </>
+          ) : null}
+          {authMessage ? <p className="mt-2 text-xs leading-5 text-[#4f6b4a]">{authMessage}</p> : null}
+          {authError ? <p className="mt-2 text-xs leading-5 text-[#b5533f]">{authError}</p> : null}
+        </section>
       ) : null}
-      {authMessage ? <p className="mt-2 text-xs leading-5 text-[#4f6b4a]">{authMessage}</p> : null}
-      {authError ? <p className="mt-2 text-xs leading-5 text-[#b5533f]">{authError}</p> : null}
-    </section>
+    </div>
+  );
+
+  return (
+    <div className="flex min-h-5 flex-wrap items-center justify-end gap-x-2 gap-y-0.5 text-[11px] font-normal text-[#8a9385]">
+      <span className="px-1">
+        {syncStatus.label}
+      </span>
+      <span className="h-4 w-px bg-[#dfe4dc]" />
+      {accountControl}
+    </div>
   );
 }
 
-function getCloudSyncStatusText(status: CloudSyncStatus, message: string) {
-  if (message) {
-    return message;
+function getCloudSyncStatusMeta({
+  isConfigured,
+  isLoggedIn,
+  status,
+  message
+}: {
+  isConfigured: boolean;
+  isLoggedIn: boolean;
+  status: CloudSyncStatus;
+  message: string;
+}) {
+  if (!isConfigured) {
+    return {
+      label: "未启用同步"
+    };
+  }
+
+  if (!isLoggedIn) {
+    return {
+      label: "未登录，仅本地保存"
+    };
   }
 
   if (status === "syncing") {
-    return "正在同步。";
+    return {
+      label: "同步中"
+    };
   }
 
   if (status === "synced") {
-    return "云端同步已完成。";
+    return {
+      label: "已同步"
+    };
   }
 
   if (status === "error") {
-    return "云端同步失败。";
+    return {
+      label: message || "同步失败"
+    };
   }
 
-  return "";
+  return {
+    label: "等待同步"
+  };
 }
 
 function PanelContent({
   panelState,
   parseStepStatuses,
-  parseProgressDetail,
+  translationProgress,
   parseCheckpoint,
   activeLearningTab,
   currentPlaybackTime,
@@ -2446,7 +2495,7 @@ function PanelContent({
 }: {
   panelState: PanelState;
   parseStepStatuses: Record<string, ParseStepStatus>;
-  parseProgressDetail: string;
+  translationProgress: TranslationProgress | null;
   parseCheckpoint: VideoParseCheckpoint | null;
   activeLearningTab: LearningTabKey;
   currentPlaybackTime: number | null;
@@ -2507,9 +2556,10 @@ function PanelContent({
   if (panelState.status === "parsing") {
     return (
       <ParsingCard
+        key={panelState.videoInfo.videoId ?? panelState.videoInfo.url}
         videoInfo={panelState.videoInfo}
         parseStepStatuses={parseStepStatuses}
-        parseProgressDetail={parseProgressDetail}
+        translationProgress={translationProgress}
       />
     );
   }
@@ -2650,80 +2700,111 @@ function ReadyToParseCard({
 function ParsingCard({
   videoInfo,
   parseStepStatuses,
-  parseProgressDetail
+  translationProgress
 }: {
   videoInfo: VideoInfo;
   parseStepStatuses: Record<string, ParseStepStatus>;
-  parseProgressDetail: string;
+  translationProgress: TranslationProgress | null;
 }) {
-  const completedCount = MOCK_PARSE_STEPS.filter(
-    (step) => parseStepStatuses[step.key] === "completed"
-  ).length;
-  const hasFailedStep = MOCK_PARSE_STEPS.some((step) => parseStepStatuses[step.key] === "failed");
-  const progressPercent = Math.round((completedCount / MOCK_PARSE_STEPS.length) * 100);
+  const displaySteps = getParseDisplaySteps(parseStepStatuses);
+  const hasFailedStep = displaySteps.some((step) => step.status === "failed");
+  const calculatedProgressPercent = getParseDisplayProgress(parseStepStatuses, translationProgress ?? undefined);
+  const [progressPercent, setProgressPercent] = React.useState(calculatedProgressPercent);
+
+  React.useEffect(() => {
+    setProgressPercent((currentProgress) =>
+      getNonDecreasingProgress(currentProgress, calculatedProgressPercent)
+    );
+  }, [calculatedProgressPercent]);
 
   return (
-    <section className="rounded-lg border border-[#dfe4dc] bg-white/70 p-4 shadow-sm">
-      <p className="text-sm font-semibold text-[#4f6b4a]">解析中</p>
-      <p className="mt-2 text-sm leading-6 text-[#6c7568]">
-        正在获取当前视频英文字幕，并交给 DeepSeek 重切分、翻译和生成总览。
-      </p>
-      {parseProgressDetail ? (
-        <p className="mt-2 rounded-md border border-[#dfe4dc] bg-[#fbfcf8] px-3 py-2 text-sm font-medium text-[#4f6b4a]">
-          {parseProgressDetail}
-        </p>
-      ) : null}
-      <VideoSummary videoInfo={videoInfo} />
-      <div className="mt-5 h-2 overflow-hidden rounded-full bg-[#e4e8df]">
-        <div
-          className="h-full rounded-full bg-[#4f6b4a] transition-all duration-500"
-          style={{ width: `${progressPercent}%` }}
-        />
-      </div>
-      <div className="mt-2 text-right text-xs font-medium text-[#6c7568]">{progressPercent}%</div>
-      <ol className="mt-5 space-y-3">
-        {MOCK_PARSE_STEPS.map((step) => (
-          <ParseStepItem key={step.key} label={step.label} status={parseStepStatuses[step.key]} />
-        ))}
-      </ol>
-      {hasFailedStep ? (
-        <div className="mt-4">
-          <GeneratedFailure title="生成失败" />
+    <div className="space-y-4">
+      <section className="rounded-lg border border-[#dfe4dc] bg-white p-4 shadow-sm">
+        <VideoSummary videoInfo={videoInfo} className="" />
+      </section>
+
+      <section className="rounded-lg border border-[#dfe4dc] bg-white p-4 shadow-sm">
+        <div className="flex items-center justify-between gap-4">
+          <div className="flex min-w-0 items-center gap-3">
+            <span className="h-6 w-6 shrink-0 animate-spin rounded-full border-4 border-[#dce8d7] border-t-[#4f6b4a]" />
+            <div className="min-w-0">
+              <p className="text-base font-semibold text-[#20241f]">解析中</p>
+              <p className="mt-1 text-sm leading-5 text-[#6c7568]">
+                正在整理当前视频内容，完成后即可进入学习。
+              </p>
+            </div>
+          </div>
+          <span className="shrink-0 text-2xl font-semibold tabular-nums text-[#4f6b4a]">
+            {progressPercent}%
+          </span>
         </div>
-      ) : null}
-    </section>
+        <div className="mt-5 h-2 overflow-hidden rounded-full bg-[#e4e8df]">
+          <div
+            className="h-full rounded-full bg-[#4f6b4a] transition-all duration-500"
+            style={{ width: `${progressPercent}%` }}
+          />
+        </div>
+      </section>
+
+      <section className="rounded-lg border border-[#dfe4dc] bg-white p-4 shadow-sm">
+        <p className="text-sm font-semibold text-[#20241f]">任务进度</p>
+        <ol className="mt-3 space-y-3">
+          {displaySteps.map((step) => (
+            <ParseStepItem key={step.key} label={step.label} status={step.status} />
+          ))}
+        </ol>
+        {hasFailedStep ? (
+          <div className="mt-4">
+            <GeneratedFailure title="生成失败" />
+          </div>
+        ) : null}
+      </section>
+    </div>
   );
 }
 
 function ParseStepItem({ label, status }: { label: string; status: ParseStepStatus }) {
-  const statusConfig: Record<ParseStepStatus, { text: string; className: string; marker: string }> = {
+  const statusConfig: Record<
+    ParseStepStatus,
+    { text: string; className: string; marker: string; itemClassName: string; symbol: string }
+  > = {
     pending: {
-      text: "待处理",
+      text: "待开始",
       marker: "bg-[#d6dbd1]",
-      className: "text-[#6c7568]"
+      className: "text-[#8a9385]",
+      itemClassName: "border-[#edf0ea] bg-[#fbfcf8]",
+      symbol: ""
     },
     processing: {
-      text: "处理中",
-      marker: "bg-[#4f6b4a]",
-      className: "text-[#4f6b4a]"
+      text: "进行中",
+      marker: "animate-pulse bg-[#4f6b4a]",
+      className: "text-[#4f6b4a]",
+      itemClassName: "border-[#b9c9ad] bg-[#f2f7ed]",
+      symbol: ""
     },
     completed: {
       text: "已完成",
       marker: "bg-[#20241f]",
-      className: "text-[#20241f]"
+      className: "text-[#20241f]",
+      itemClassName: "border-[#d7ded1] bg-white",
+      symbol: "✓"
     },
     failed: {
       text: "失败",
       marker: "bg-[#b5533f]",
-      className: "text-[#b5533f]"
+      className: "text-[#b5533f]",
+      itemClassName: "border-[#efc8bd] bg-[#fff7f3]",
+      symbol: "!"
     }
   };
   const config = statusConfig[status];
 
   return (
-    <li className="flex items-center justify-between gap-3 rounded-md border border-[#edf0ea] bg-[#fbfcf8] px-3 py-2">
+    <li className={`flex items-center justify-between gap-3 rounded-md border px-3 py-2 ${config.itemClassName}`}>
       <div className="flex min-w-0 items-center gap-3">
-        <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${config.marker}`} />
+        <span className={`grid h-4 w-4 shrink-0 place-items-center rounded-full text-[10px] font-bold text-white ${config.marker}`}>
+          {config.symbol}
+        </span>
         <span className="truncate text-sm font-medium">{label}</span>
       </div>
       <span className={`shrink-0 text-xs font-semibold ${config.className}`}>{config.text}</span>
@@ -2799,36 +2880,7 @@ function LearningView({
   onSaveNote: (noteId: string) => void;
 }) {
   return (
-    <div className="space-y-4">
-      <section className="flex items-center justify-between gap-3 rounded-lg border border-[#dfe4dc] bg-white/70 p-3 text-xs shadow-sm">
-        <div className="min-w-0 leading-5 text-[#6c7568]">
-          <span className="font-semibold text-[#4f6b4a]">
-            {overviewSource === "ai" || subtitleSource === "ai" ? "DeepSeek AI 已参与生成" : "当前展示 Mock / 历史缓存"}
-          </span>
-          <span className="ml-2">
-            字幕：{getGenerationSourceLabel(subtitleSource)} · 总览：{getGenerationSourceLabel(overviewSource)}
-          </span>
-        </div>
-        <div className="flex shrink-0 gap-2">
-          {subtitleSource === "partial" ? (
-            <button
-              type="button"
-              className="rounded-md bg-[#20241f] px-3 py-2 font-semibold text-white transition hover:bg-[#343a31]"
-              onClick={() => onContinueParsing(videoInfo)}
-            >
-              继续解析
-            </button>
-          ) : null}
-          <button
-            type="button"
-            className="rounded-md border border-[#20241f] px-3 py-2 font-semibold text-[#20241f] transition hover:bg-[#eef5e8]"
-            onClick={() => onStartParsing(videoInfo)}
-          >
-            重新解析
-          </button>
-        </div>
-      </section>
-
+    <div className="flex min-h-0 flex-1 flex-col gap-4">
       <nav className="grid grid-cols-5 rounded-lg border border-[#dfe4dc] bg-white/70 p-1 shadow-sm">
         {LEARNING_TABS.map((tab) => {
           const isActive = activeLearningTab === tab.key;
@@ -2848,7 +2900,9 @@ function LearningView({
         })}
       </nav>
 
-      <section className="rounded-lg border border-[#dfe4dc] bg-white/70 p-4 shadow-sm">
+      <section
+        className="min-h-0 flex-1 overflow-y-auto rounded-lg border border-[#dfe4dc] bg-white/70 p-4 shadow-sm"
+      >
         <LearningTabContent
           activeLearningTab={activeLearningTab}
           videoInfo={videoInfo}
@@ -2868,6 +2922,8 @@ function LearningView({
           onSendChatDraft={onSendChatDraft}
           onSeekToTime={onSeekToTime}
           onSelectSubtitle={onSelectSubtitle}
+          onStartParsing={onStartParsing}
+          onContinueParsing={onContinueParsing}
           onGenerateMoreVocabularyExamples={onGenerateMoreVocabularyExamples}
           onUpdateNoteComment={onUpdateNoteComment}
           onOrganizeNote={onOrganizeNote}
@@ -2908,6 +2964,8 @@ function LearningTabContent({
   onSendChatDraft,
   onSeekToTime,
   onSelectSubtitle,
+  onStartParsing,
+  onContinueParsing,
   onGenerateMoreVocabularyExamples,
   onUpdateNoteComment,
   onOrganizeNote,
@@ -2932,6 +2990,8 @@ function LearningTabContent({
   onSendChatDraft: () => void | Promise<void>;
   onSeekToTime: (timeSeconds: number) => void;
   onSelectSubtitle: (selection: SelectedSubtitle) => void;
+  onStartParsing: (videoInfo: VideoInfo) => void | Promise<void>;
+  onContinueParsing: (videoInfo: VideoInfo) => void | Promise<void>;
   onGenerateMoreVocabularyExamples: (vocabularyItemId: string) => void;
   onUpdateNoteComment: (noteId: string, userComment: string) => void;
   onOrganizeNote: (noteId: string) => void;
@@ -2941,7 +3001,17 @@ function LearningTabContent({
   if (activeLearningTab === "overview") {
     return (
       <>
-        <VideoSummary videoInfo={videoInfo} />
+        <VideoSummary
+          videoInfo={videoInfo}
+          titleZh={learningOverview?.titleZh}
+          actions={
+            <VideoSummaryActions
+              showContinue={subtitleSource === "partial"}
+              onRestart={() => onStartParsing(videoInfo)}
+              onContinue={() => onContinueParsing(videoInfo)}
+            />
+          }
+        />
         <OverviewContent
           overview={learningOverview}
           source={overviewSource}
@@ -3118,14 +3188,14 @@ function SubtitlesContent({
   }
 
   return (
-    <>
+    <div>
       <p className="text-sm leading-6 text-[#6c7568]">
         当前播放时间：{formatDuration(currentPlaybackTime)}
         <span className="ml-2 text-xs font-semibold text-[#4f6b4a]">
           字幕来源：{getGenerationSourceLabel(source)}
         </span>
       </p>
-      <div className="mt-5 max-h-[58vh] space-y-3 overflow-y-auto pr-1">
+      <div className="mt-5 space-y-3 pr-1">
         {subtitleSegments.map((segment, index) => {
           const isActive = index === activeSubtitleIndex;
 
@@ -3162,7 +3232,7 @@ function SubtitlesContent({
           );
         })}
       </div>
-    </>
+    </div>
   );
 }
 
@@ -3544,39 +3614,80 @@ function AiLoadingBlock({ description }: { description: string }) {
   );
 }
 
-function VideoSummary({ videoInfo }: { videoInfo: VideoInfo }) {
+function VideoSummary({
+  videoInfo,
+  titleZh,
+  className = "mt-5",
+  actions
+}: {
+  videoInfo: VideoInfo;
+  titleZh?: string;
+  className?: string;
+  actions?: React.ReactNode;
+}) {
   return (
-    <div className="mt-5">
-      <div className="flex gap-3">
+    <div className={className}>
+      <div className="flex flex-wrap items-start gap-4">
         {videoInfo.thumbnailUrl ? (
           <img
             src={videoInfo.thumbnailUrl}
             alt=""
-            className="h-16 w-24 shrink-0 rounded-md object-cover"
+            className="h-20 w-32 shrink-0 rounded-md object-cover"
           />
         ) : null}
-        <div className="min-w-0">
-          <p className="text-xs font-medium text-[#6c7568]">已识别 YouTube 视频</p>
-          <h2 className="mt-1 line-clamp-3 text-base font-semibold leading-6">{videoInfo.title || "标题读取中"}</h2>
+        <div className="min-w-[12rem] flex-1">
+          <h2 className="line-clamp-2 text-base font-semibold leading-6">
+            {videoInfo.title || "标题读取中"}
+          </h2>
+          {titleZh ? <p className="mt-2 line-clamp-1 text-sm font-medium leading-5 text-[#4f6b4a]">{titleZh}</p> : null}
+          <dl className="mt-3 flex flex-wrap gap-x-5 gap-y-2 text-sm">
+            <VideoMetaItem label="时长" value={formatDuration(videoInfo.durationSeconds)} />
+            <VideoMetaItem label="频道" value={videoInfo.channelName || "读取中"} />
+          </dl>
         </div>
+        {actions ? <div className="ml-auto flex shrink-0 flex-wrap justify-end gap-2 pt-1">{actions}</div> : null}
       </div>
-
-      <dl className="mt-5 space-y-3 text-sm">
-        <InfoRow label="videoId" value={videoInfo.videoId || "读取中"} />
-        <InfoRow label="时长" value={formatDuration(videoInfo.durationSeconds)} />
-        <InfoRow label="频道" value={videoInfo.channelName || "读取中"} />
-        <InfoRow label="URL" value={videoInfo.url} />
-      </dl>
     </div>
   );
 }
 
-function InfoRow({ label, value }: { label: string; value: string }) {
+function VideoMetaItem({ label, value }: { label: string; value: string }) {
   return (
-    <div className="grid grid-cols-[4.5rem_1fr] gap-2">
-      <dt className="text-[#6c7568]">{label}</dt>
-      <dd className="break-words font-medium text-[#20241f]">{value}</dd>
+    <div className="flex min-w-0 items-center gap-2">
+      <dt className="shrink-0 text-[#6c7568]">{label}</dt>
+      <dd className="min-w-0 truncate font-medium text-[#20241f]">{value}</dd>
     </div>
+  );
+}
+
+function VideoSummaryActions({
+  showContinue,
+  onRestart,
+  onContinue
+}: {
+  showContinue: boolean;
+  onRestart: () => void | Promise<void>;
+  onContinue: () => void | Promise<void>;
+}) {
+  return (
+    <>
+      <button
+        type="button"
+        className="rounded-md border border-[#aebda8] bg-white px-3 py-2 text-xs font-semibold text-[#4f6b4a] transition hover:border-[#4f6b4a] hover:bg-[#eef5e8]"
+        onClick={onRestart}
+      >
+        重新解析
+      </button>
+      {showContinue ? (
+        <button
+          type="button"
+          className="rounded-md bg-[#4f6b4a] px-3 py-2 text-xs font-semibold text-white shadow-sm transition hover:bg-[#415b3d]"
+          onClick={onContinue}
+        >
+          继续解析
+        </button>
+      ) : null}
+    </>
   );
 }
 

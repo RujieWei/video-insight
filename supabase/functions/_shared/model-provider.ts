@@ -27,7 +27,7 @@ export type VocabularyExamplesInput = {
 
 export interface ModelProvider {
   segmentAndTranslateSubtitles(rawSegments: RawSubtitleSegment[]): Promise<GeneratedSubtitleSegment[]>;
-  generateOverview(segments: OverviewSubtitleSegment[]): Promise<GeneratedOverview>;
+  generateOverview(segments: OverviewSubtitleSegment[], videoTitle?: string): Promise<GeneratedOverview>;
   organizeNote(input: OrganizeNoteInput): Promise<string>;
   answerQuestion(input: AnswerQuestionInput): Promise<string>;
   generateVocabularyItem(input: GenerateVocabularyItemInput): Promise<VocabularyItem>;

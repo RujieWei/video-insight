@@ -83,10 +83,10 @@ export class DeepSeekProvider implements ModelProvider {
     });
   }
 
-  async generateOverview(segments: OverviewSubtitleSegment[]) {
+  async generateOverview(segments: OverviewSubtitleSegment[], videoTitle?: string) {
     const payload = await this.callJson(
       "你是一个面向 AI 产品经理、创业者和科技从业者的视频内容分析助手。你必须只输出合法 JSON 对象。",
-      `请基于英文字幕生成中文学习总览。不要编造字幕之外的信息。摘要控制在 3-5 句；章节建议 5-8 个；每章 keyPoints 控制在 2-3 条。严格输出 JSON 对象，格式为 {"overview":{"summary":"...","chapters":[{"title":"...","startTime":0,"endTime":300,"summary":"...","keyPoints":["..."]}]}}。\n\n英文字幕：\n${JSON.stringify(segments)}`
+      `请基于英文标题和英文字幕生成中文学习总览。不要编造字幕之外的信息。titleZh 是英文标题的自然中文短标题；摘要控制在 3-5 句；章节建议 5-8 个；每章 keyPoints 控制在 2-3 条。严格输出 JSON 对象，格式为 {"overview":{"titleZh":"...","summary":"...","chapters":[{"title":"...","startTime":0,"endTime":300,"summary":"...","keyPoints":["..."]}]}}。\n\n输入：\n${JSON.stringify({ videoTitle, segments })}`
     );
 
     return validateOverview(payload);
@@ -105,10 +105,10 @@ export class DeepSeekProvider implements ModelProvider {
     return validateOverviewChunk(payload);
   }
 
-  async generateOverviewFromChunks(chunks: OverviewChunk[]) {
+  async generateOverviewFromChunks(chunks: OverviewChunk[], videoTitle?: string) {
     const payload = await this.callJson(
       "你是一个面向 AI 产品经理、创业者和科技从业者的视频内容分析助手。你必须只输出合法 JSON 对象。",
-      `请基于视频分段摘要生成最终中文学习总览。不要编造分段摘要之外的信息。摘要控制在 3-5 句；章节建议 5-8 个；每章 keyPoints 控制在 2-3 条；章节时间必须落在输入分段时间范围内。严格输出 JSON 对象，格式为 {"overview":{"summary":"...","chapters":[{"title":"...","startTime":0,"endTime":300,"summary":"...","keyPoints":["..."]}]}}。\n\n分段摘要：\n${JSON.stringify(chunks)}`
+      `请基于英文标题和视频分段摘要生成最终中文学习总览。不要编造分段摘要之外的信息。titleZh 是英文标题的自然中文短标题；摘要控制在 3-5 句；章节建议 5-8 个；每章 keyPoints 控制在 2-3 条；章节时间必须落在输入分段时间范围内。严格输出 JSON 对象，格式为 {"overview":{"titleZh":"...","summary":"...","chapters":[{"title":"...","startTime":0,"endTime":300,"summary":"...","keyPoints":["..."]}]}}。\n\n输入：\n${JSON.stringify({ videoTitle, chunks })}`
     );
 
     return validateOverview(payload);
