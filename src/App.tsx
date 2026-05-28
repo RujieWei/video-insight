@@ -2879,6 +2879,40 @@ function LearningView({
   onCancelNote: (noteId: string) => void;
   onSaveNote: (noteId: string) => void;
 }) {
+  const scrollContainerRef = React.useRef<HTMLElement | null>(null);
+  const tabScrollPositionsRef = React.useRef<Partial<Record<LearningTabKey, number>>>({});
+  const scrollScopeKey = videoInfo.videoId ?? videoInfo.url;
+  const scrollScopeRef = React.useRef(scrollScopeKey);
+
+  React.useLayoutEffect(() => {
+    const scrollContainer = scrollContainerRef.current;
+
+    if (!scrollContainer) {
+      return;
+    }
+
+    if (scrollScopeRef.current !== scrollScopeKey) {
+      tabScrollPositionsRef.current = {};
+      scrollScopeRef.current = scrollScopeKey;
+    }
+
+    scrollContainer.scrollTop = tabScrollPositionsRef.current[activeLearningTab] ?? 0;
+  }, [activeLearningTab, scrollScopeKey]);
+
+  function handleSelectLearningTab(tabKey: LearningTabKey) {
+    const scrollContainer = scrollContainerRef.current;
+
+    if (scrollContainer) {
+      tabScrollPositionsRef.current[activeLearningTab] = scrollContainer.scrollTop;
+    }
+
+    onSelectLearningTab(tabKey);
+  }
+
+  function handleLearningTabScroll(event: React.UIEvent<HTMLElement>) {
+    tabScrollPositionsRef.current[activeLearningTab] = event.currentTarget.scrollTop;
+  }
+
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-4">
       <nav className="grid grid-cols-5 rounded-lg border border-[#dfe4dc] bg-white/70 p-1 shadow-sm">
@@ -2892,7 +2926,7 @@ function LearningView({
               className={`rounded-md px-2 py-2 text-sm font-semibold transition ${
                 isActive ? "bg-[#20241f] text-white" : "text-[#6c7568] hover:bg-[#eef2ea]"
               }`}
-              onClick={() => onSelectLearningTab(tab.key)}
+              onClick={() => handleSelectLearningTab(tab.key)}
             >
               {tab.label}
             </button>
@@ -2901,7 +2935,9 @@ function LearningView({
       </nav>
 
       <section
+        ref={scrollContainerRef}
         className="min-h-0 flex-1 overflow-y-auto rounded-lg border border-[#dfe4dc] bg-white/70 p-4 shadow-sm"
+        onScroll={handleLearningTabScroll}
       >
         <LearningTabContent
           activeLearningTab={activeLearningTab}
@@ -2918,6 +2954,7 @@ function LearningView({
           mockChatItems={mockChatItems}
           mockNoteItems={mockNoteItems}
           mockVocabularyItems={mockVocabularyItems}
+          shouldPreserveInitialScroll={tabScrollPositionsRef.current[activeLearningTab] !== undefined}
           onChatDraftChange={onChatDraftChange}
           onSendChatDraft={onSendChatDraft}
           onSeekToTime={onSeekToTime}
@@ -2960,6 +2997,7 @@ function LearningTabContent({
   mockChatItems,
   mockNoteItems,
   mockVocabularyItems,
+  shouldPreserveInitialScroll,
   onChatDraftChange,
   onSendChatDraft,
   onSeekToTime,
@@ -2986,6 +3024,7 @@ function LearningTabContent({
   mockChatItems: MockChatItem[];
   mockNoteItems: MockNoteItem[];
   mockVocabularyItems: MockVocabularyItem[];
+  shouldPreserveInitialScroll: boolean;
   onChatDraftChange: (draft: string) => void;
   onSendChatDraft: () => void | Promise<void>;
   onSeekToTime: (timeSeconds: number) => void;
@@ -3027,6 +3066,7 @@ function LearningTabContent({
         subtitleSegments={subtitleSegments}
         source={subtitleSource}
         currentPlaybackTime={currentPlaybackTime}
+        shouldPreserveInitialScroll={shouldPreserveInitialScroll}
         onSeekToTime={onSeekToTime}
         onSelectSubtitle={onSelectSubtitle}
       />
@@ -3145,19 +3185,30 @@ function SubtitlesContent({
   subtitleSegments,
   source,
   currentPlaybackTime,
+  shouldPreserveInitialScroll,
   onSeekToTime,
   onSelectSubtitle
 }: {
   subtitleSegments: SubtitleSegment[];
   source: GenerationSource;
   currentPlaybackTime: number | null;
+  shouldPreserveInitialScroll: boolean;
   onSeekToTime: (timeSeconds: number) => void;
   onSelectSubtitle: (selection: SelectedSubtitle) => void;
 }) {
   const activeSubtitleIndex = findActiveSubtitleIndex(subtitleSegments, currentPlaybackTime);
   const subtitleRefs = React.useRef<Record<number, HTMLElement | null>>({});
+  const didMountRef = React.useRef(false);
 
   React.useEffect(() => {
+    if (!didMountRef.current) {
+      didMountRef.current = true;
+
+      if (shouldPreserveInitialScroll) {
+        return;
+      }
+    }
+
     if (activeSubtitleIndex < 0) {
       return;
     }
@@ -3166,7 +3217,7 @@ function SubtitlesContent({
       block: "center",
       behavior: "auto"
     });
-  }, [activeSubtitleIndex]);
+  }, [activeSubtitleIndex, shouldPreserveInitialScroll]);
 
   function handleSubtitleMouseUp(segment: SubtitleSegment) {
     const selection = window.getSelection();
@@ -3640,22 +3691,20 @@ function VideoSummary({
             {videoInfo.title || "标题读取中"}
           </h2>
           {titleZh ? <p className="mt-2 line-clamp-1 text-sm font-medium leading-5 text-[#4f6b4a]">{titleZh}</p> : null}
-          <dl className="mt-3 flex flex-wrap gap-x-5 gap-y-2 text-sm">
-            <VideoMetaItem label="时长" value={formatDuration(videoInfo.durationSeconds)} />
-            <VideoMetaItem label="频道" value={videoInfo.channelName || "读取中"} />
-          </dl>
+          <div className="mt-3 flex min-w-0 items-center gap-x-3 text-xs text-[#6f776b]">
+            <span className="flex shrink-0 items-center gap-1">
+              <span className="text-[#8a9385]">时长</span>
+              <span>{formatDuration(videoInfo.durationSeconds)}</span>
+            </span>
+            <span className="text-[#a3aa9d]">·</span>
+            <span className="flex min-w-0 items-center gap-1">
+              <span className="shrink-0 text-[#8a9385]">频道</span>
+              <span className="min-w-0 truncate">{videoInfo.channelName || "读取中"}</span>
+            </span>
+          </div>
         </div>
         {actions ? <div className="ml-auto flex shrink-0 flex-wrap justify-end gap-2 pt-1">{actions}</div> : null}
       </div>
-    </div>
-  );
-}
-
-function VideoMetaItem({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="flex min-w-0 items-center gap-2">
-      <dt className="shrink-0 text-[#6c7568]">{label}</dt>
-      <dd className="min-w-0 truncate font-medium text-[#20241f]">{value}</dd>
     </div>
   );
 }
