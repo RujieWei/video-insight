@@ -121,6 +121,24 @@ function assertRecord(value: unknown, fieldName: string): Record<string, unknown
   return value;
 }
 
+function readField(record: Record<string, unknown>, fieldNames: string[]) {
+  for (const fieldName of fieldNames) {
+    if (fieldName in record) {
+      return record[fieldName];
+    }
+  }
+
+  return undefined;
+}
+
+function assertAliasedNumber(record: Record<string, unknown>, fieldNames: string[], fieldName: string) {
+  return assertNumber(readField(record, fieldNames), fieldName);
+}
+
+function assertAliasedStringArray(record: Record<string, unknown>, fieldNames: string[], fieldName: string) {
+  return assertStringArray(readField(record, fieldNames), fieldName);
+}
+
 export function validateSubtitleSegments(value: unknown): GeneratedSubtitleSegment[] {
   const root = assertRecord(value, "root");
   const segments = root.segments;
@@ -176,21 +194,32 @@ export function validateOverview(value: unknown): GeneratedOverview {
     throw new InvalidModelOutputError("overview.chapters must be a non-empty array");
   }
 
+  const titleZh = readField(overview, ["titleZh", "title_zh"]);
+
   return {
-    titleZh:
-      typeof overview.titleZh === "string" && overview.titleZh.trim()
-        ? overview.titleZh
-        : undefined,
+    titleZh: typeof titleZh === "string" && titleZh.trim() ? titleZh : undefined,
     summary: assertString(overview.summary, "overview.summary"),
     chapters: chapters.map((chapter, index) => {
       const item = assertRecord(chapter, `overview.chapters[${index}]`);
 
       return {
         title: assertString(item.title, `overview.chapters[${index}].title`),
-        startTime: assertNumber(item.startTime, `overview.chapters[${index}].startTime`),
-        endTime: assertNumber(item.endTime, `overview.chapters[${index}].endTime`),
+        startTime: assertAliasedNumber(
+          item,
+          ["startTime", "start_time"],
+          `overview.chapters[${index}].startTime`
+        ),
+        endTime: assertAliasedNumber(
+          item,
+          ["endTime", "end_time"],
+          `overview.chapters[${index}].endTime`
+        ),
         summary: assertString(item.summary, `overview.chapters[${index}].summary`),
-        keyPoints: assertStringArray(item.keyPoints, `overview.chapters[${index}].keyPoints`)
+        keyPoints: assertAliasedStringArray(
+          item,
+          ["keyPoints", "key_points"],
+          `overview.chapters[${index}].keyPoints`
+        )
       };
     }),
     timeline: Array.isArray(timeline)
@@ -216,11 +245,11 @@ export function validateOverviewChunk(value: unknown): OverviewChunk {
   const chunk = assertRecord(root.chunk, "chunk");
 
   return {
-    chunkIndex: assertNumber(chunk.chunkIndex, "chunk.chunkIndex"),
-    startTime: assertNumber(chunk.startTime, "chunk.startTime"),
-    endTime: assertNumber(chunk.endTime, "chunk.endTime"),
+    chunkIndex: assertAliasedNumber(chunk, ["chunkIndex", "chunk_index"], "chunk.chunkIndex"),
+    startTime: assertAliasedNumber(chunk, ["startTime", "start_time"], "chunk.startTime"),
+    endTime: assertAliasedNumber(chunk, ["endTime", "end_time"], "chunk.endTime"),
     summary: assertString(chunk.summary, "chunk.summary"),
-    keyPoints: assertStringArray(chunk.keyPoints, "chunk.keyPoints")
+    keyPoints: assertAliasedStringArray(chunk, ["keyPoints", "key_points"], "chunk.keyPoints")
   };
 }
 

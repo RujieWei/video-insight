@@ -1,6 +1,8 @@
 import type { LearningOverview, SubtitleSegment } from "../types/learning";
+import { isRetriableAiTaskError } from "../utils/ai-errors";
 import {
   chunkOverviewSegments,
+  createFallbackOverviewFromChunks,
   getOverviewCharacterCount,
   runOverviewChunkQueue,
   toOverviewSourceSegments,
@@ -37,9 +39,35 @@ type TranscriptResult = {
 
 const OVERVIEW_SINGLE_CALL_MAX_SEGMENTS = 120;
 const OVERVIEW_SINGLE_CALL_MAX_CHARACTERS = 12000;
-const OVERVIEW_CHUNK_MAX_SEGMENTS = 70;
-const OVERVIEW_CHUNK_MAX_CHARACTERS = 7000;
-const OVERVIEW_CHUNK_CONCURRENCY = 3;
+const OVERVIEW_CHUNK_MAX_SEGMENTS = 40;
+const OVERVIEW_CHUNK_MAX_CHARACTERS = 4000;
+const OVERVIEW_CHUNK_CONCURRENCY = 2;
+const OVERVIEW_MAX_RETRIES = 2;
+const OVERVIEW_RETRY_DELAY_MS = 800;
+
+function sleep(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+async function invokeOverviewTaskWithRetry<T>(task: string, payload: Record<string, unknown>) {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= OVERVIEW_MAX_RETRIES; attempt += 1) {
+    try {
+      return await invokeAiTask<T>(task, payload);
+    } catch (error) {
+      lastError = error;
+
+      if (attempt >= OVERVIEW_MAX_RETRIES || !isRetriableAiTaskError(error)) {
+        throw error;
+      }
+
+      await sleep(OVERVIEW_RETRY_DELAY_MS * (attempt + 1));
+    }
+  }
+
+  throw lastError;
+}
 
 async function invokeAiTask<T>(task: string, payload: Record<string, unknown>) {
   if (!supabase) {
@@ -119,7 +147,7 @@ export async function fetchTranscriptWithCaptionProvider(input: {
 
 export async function generateOverview(segments: SubtitleSegment[], videoTitle?: string) {
   const overviewSegments = toOverviewSourceSegments(segments);
-  const result = await invokeAiTask<{ overview: LearningOverview }>("generateOverview", {
+  const result = await invokeOverviewTaskWithRetry<{ overview: LearningOverview }>("generateOverview", {
     segments: overviewSegments,
     videoTitle
   });
@@ -134,12 +162,18 @@ export async function generateOverviewForLongVideo(segments: SubtitleSegment[], 
     overviewSegments.length <= OVERVIEW_SINGLE_CALL_MAX_SEGMENTS &&
     getOverviewCharacterCount(overviewSegments) <= OVERVIEW_SINGLE_CALL_MAX_CHARACTERS
   ) {
-    const result = await invokeAiTask<{ overview: LearningOverview }>("generateOverview", {
-      segments: overviewSegments,
-      videoTitle
-    });
+    try {
+      const result = await invokeOverviewTaskWithRetry<{ overview: LearningOverview }>("generateOverview", {
+        segments: overviewSegments,
+        videoTitle
+      });
 
-    return result.overview;
+      return result.overview;
+    } catch (error) {
+      if (!isRetriableAiTaskError(error)) {
+        throw error;
+      }
+    }
   }
 
   const chunks = await runOverviewChunkQueue({
@@ -149,17 +183,31 @@ export async function generateOverviewForLongVideo(segments: SubtitleSegment[], 
     }),
     concurrency: OVERVIEW_CHUNK_CONCURRENCY,
     generateChunk: async (chunkInput) => {
-      const result = await invokeAiTask<{ chunk: OverviewChunkResult }>("generateOverviewChunk", chunkInput);
+      const result = await invokeOverviewTaskWithRetry<{ chunk: OverviewChunkResult }>(
+        "generateOverviewChunk",
+        chunkInput
+      );
       return result.chunk;
     }
   });
 
-  const result = await invokeAiTask<{ overview: LearningOverview }>("generateOverviewFromChunks", {
-    chunks,
-    videoTitle
-  });
+  try {
+    const result = await invokeOverviewTaskWithRetry<{ overview: LearningOverview }>(
+      "generateOverviewFromChunks",
+      {
+        chunks,
+        videoTitle
+      }
+    );
 
-  return result.overview;
+    return result.overview;
+  } catch (error) {
+    if (!isRetriableAiTaskError(error)) {
+      throw error;
+    }
+
+    return createFallbackOverviewFromChunks(chunks, videoTitle);
+  }
 }
 
 export async function organizeNoteWithAi(input: {

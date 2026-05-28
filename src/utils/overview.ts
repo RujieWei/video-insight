@@ -1,4 +1,4 @@
-import type { SubtitleSegment } from "../types/learning";
+import type { LearningOverview, SubtitleSegment } from "../types/learning";
 
 export type OverviewSourceSegment = Pick<SubtitleSegment, "startTime" | "endTime" | "englishText">;
 
@@ -96,4 +96,47 @@ export async function runOverviewChunkQueue({
   );
 
   return results.sort((left, right) => left.chunkIndex - right.chunkIndex);
+}
+
+function combineKeyPoints(chunks: OverviewChunkResult[]) {
+  const keyPoints = chunks.flatMap((chunk) => chunk.keyPoints).filter(Boolean);
+  return keyPoints.slice(0, 3);
+}
+
+export function createFallbackOverviewFromChunks(
+  chunks: OverviewChunkResult[],
+  videoTitle?: string
+): LearningOverview {
+  if (chunks.length === 0) {
+    throw new Error("Cannot create fallback overview without overview chunks");
+  }
+
+  const orderedChunks = chunks.slice().sort((left, right) => left.chunkIndex - right.chunkIndex);
+  const summary = orderedChunks
+    .map((chunk) => chunk.summary)
+    .filter(Boolean)
+    .slice(0, 5)
+    .join(" ");
+  const chapterGroupSize = Math.max(1, Math.ceil(orderedChunks.length / 6));
+  const chapters: LearningOverview["chapters"] = [];
+
+  for (let index = 0; index < orderedChunks.length; index += chapterGroupSize) {
+    const group = orderedChunks.slice(index, index + chapterGroupSize);
+    const firstChunk = group[0];
+    const lastChunk = group[group.length - 1];
+
+    chapters.push({
+      title: `第 ${chapters.length + 1} 部分`,
+      startTime: firstChunk.startTime,
+      endTime: lastChunk.endTime,
+      summary: group.map((chunk) => chunk.summary).join(" "),
+      keyPoints: combineKeyPoints(group)
+    });
+  }
+
+  return {
+    titleZh: "视频学习总览",
+    summary,
+    chapters
+  };
 }

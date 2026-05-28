@@ -1481,7 +1481,7 @@ function App() {
 
           if (checkpointSegments.length > 0) {
             learnedVideoIdRef.current = videoInfo.videoId;
-            setActiveLearningTab("subtitles");
+            setActiveLearningTab("overview");
             setPanelState({ status: "learning", videoInfo });
             return;
           }
@@ -1785,7 +1785,7 @@ function App() {
         setStepsStatus(["translate_subtitles"], "failed");
         parsingVideoIdRef.current = null;
         learnedVideoIdRef.current = videoId;
-        setActiveLearningTab("subtitles");
+        setActiveLearningTab("overview");
         setPanelState({ status: "learning", videoInfo });
         return;
       }
@@ -3265,7 +3265,6 @@ function LearningTabContent({
 
 function OverviewContent({
   overview,
-  source,
   hasGenerationFailed
 }: {
   overview: LearningOverview | null;
@@ -3282,7 +3281,6 @@ function OverviewContent({
 
   return (
     <div className="mt-5 space-y-4">
-      <p className="text-xs font-semibold text-[#4f6b4a]">总览来源：{getGenerationSourceLabel(source)}</p>
       <GeneratedSection title="视频摘要">
         <p className="text-sm leading-6 text-[#394038]">{overview.summary}</p>
       </GeneratedSection>

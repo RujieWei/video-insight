@@ -86,7 +86,7 @@ export class DeepSeekProvider implements ModelProvider {
   async generateOverview(segments: OverviewSubtitleSegment[], videoTitle?: string) {
     const payload = await this.callJson(
       "你是一个面向 AI 产品经理、创业者和科技从业者的视频内容分析助手。你必须只输出合法 JSON 对象。",
-      `请基于英文标题和英文字幕生成中文学习总览。不要编造字幕之外的信息。titleZh 是英文标题的自然中文短标题；摘要控制在 3-5 句；章节建议 5-8 个；每章 keyPoints 控制在 2-3 条。严格输出 JSON 对象，格式为 {"overview":{"titleZh":"...","summary":"...","chapters":[{"title":"...","startTime":0,"endTime":300,"summary":"...","keyPoints":["..."]}]}}。\n\n输入：\n${JSON.stringify({ videoTitle, segments })}`
+      `请基于英文标题和英文字幕生成中文学习总览。不要编造字幕之外的信息。严格输出 JSON 对象，不要输出解释文字。要求：titleZh 是英文标题的自然中文短标题；summary 为 3-5 句中文；chapters 必须输出 5-8 个；每个章节必须有 title、startTime、endTime、summary、keyPoints；keyPoints 必须有 2-3 条；章节时间必须落在输入字幕时间范围内。输出格式只能是 {"overview":{"titleZh":"...","summary":"...","chapters":[{"title":"...","startTime":0,"endTime":300,"summary":"...","keyPoints":["...","..."]}]}}。\n\n输入：\n${JSON.stringify({ videoTitle, segments })}`
     );
 
     return validateOverview(payload);
@@ -98,7 +98,7 @@ export class DeepSeekProvider implements ModelProvider {
   }) {
     const payload = await this.callJson(
       "你是一个面向 AI 产品经理、创业者和科技从业者的视频内容分析助手。你必须只输出合法 JSON 对象。",
-      `请基于这一段英文字幕生成中文分段摘要。不要编造字幕之外的信息。summary 控制在 2-3 句；keyPoints 控制在 2-3 条。严格输出 JSON 对象，格式为 {"chunk":{"chunkIndex":0,"startTime":0,"endTime":300,"summary":"...","keyPoints":["..."]}}。\n\n输入：\n${JSON.stringify(input)}`,
+      `请只基于这一小段英文字幕生成中文分段摘要。不要生成章节，不要生成标题，不要编造字幕之外的信息。严格输出 JSON 对象，不要输出解释文字。要求：chunkIndex 必须等于输入 chunkIndex；startTime 使用第一条字幕 startTime；endTime 使用最后一条字幕 endTime；summary 为 1-2 句中文；keyPoints 必须有 2-3 条。输出格式只能是 {"chunk":{"chunkIndex":0,"startTime":0,"endTime":300,"summary":"...","keyPoints":["...","..."]}}。\n\n输入：\n${JSON.stringify(input)}`,
       1600
     );
 
@@ -108,7 +108,7 @@ export class DeepSeekProvider implements ModelProvider {
   async generateOverviewFromChunks(chunks: OverviewChunk[], videoTitle?: string) {
     const payload = await this.callJson(
       "你是一个面向 AI 产品经理、创业者和科技从业者的视频内容分析助手。你必须只输出合法 JSON 对象。",
-      `请基于英文标题和视频分段摘要生成最终中文学习总览。不要编造分段摘要之外的信息。titleZh 是英文标题的自然中文短标题；摘要控制在 3-5 句；章节建议 5-8 个；每章 keyPoints 控制在 2-3 条；章节时间必须落在输入分段时间范围内。严格输出 JSON 对象，格式为 {"overview":{"titleZh":"...","summary":"...","chapters":[{"title":"...","startTime":0,"endTime":300,"summary":"...","keyPoints":["..."]}]}}。\n\n输入：\n${JSON.stringify({ videoTitle, chunks })}`
+      `请只基于输入的分段摘要生成最终中文学习总览，不要回看或假设原字幕，不要编造分段摘要之外的信息。严格输出 JSON 对象，不要输出解释文字。要求：titleZh 是英文标题的自然中文短标题；summary 为 3-5 句中文；chapters 必须输出 5-8 个，如果分段数量少于 5 个则按分段数量输出；每个章节必须有 title、startTime、endTime、summary、keyPoints；keyPoints 必须有 2-3 条；章节时间必须落在输入 chunks 的时间范围内。输出格式只能是 {"overview":{"titleZh":"...","summary":"...","chapters":[{"title":"...","startTime":0,"endTime":300,"summary":"...","keyPoints":["...","..."]}]}}。\n\n输入：\n${JSON.stringify({ videoTitle, chunks })}`
     );
 
     return validateOverview(payload);

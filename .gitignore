@@ -5,3 +5,8 @@ dist
 !.env.example
 .DS_Store
 supabase/.temp/
+
+# Local AI assistant tooling
+.agents/
+.claude/
+skills-lock.json
