@@ -147,6 +147,8 @@ const ENGLISH_CAPTIONS_REQUEST = "VIDEO_INSIGHT_GET_ENGLISH_CAPTIONS";
 const STORAGE_KEY_PREFIX = "video-insight:learning:";
 const PARSE_CHECKPOINT_KEY_PREFIX = "video-insight:parse-checkpoint:";
 const SUBTITLE_TRANSLATION_CONCURRENCY = 3;
+const SUBTITLE_AUTO_FOLLOW_IDLE_MS = 5000;
+const PROGRAMMATIC_SCROLL_GUARD_MS = 120;
 
 const MOCK_PARSE_STEPS: ParseStep[] = [
   { key: "fetch_captions", label: "获取英文字幕" },
@@ -2881,8 +2883,18 @@ function LearningView({
 }) {
   const scrollContainerRef = React.useRef<HTMLElement | null>(null);
   const tabScrollPositionsRef = React.useRef<Partial<Record<LearningTabKey, number>>>({});
+  const subtitleAutoFollowTimerRef = React.useRef<number | null>(null);
+  const subtitleProgrammaticScrollRef = React.useRef(false);
+  const subtitleProgrammaticScrollTimeoutRef = React.useRef<number | null>(null);
+  const subtitlePointerActiveRef = React.useRef(false);
+  const activeLearningTabRef = React.useRef(activeLearningTab);
+  const selectedSubtitleRef = React.useRef(selectedSubtitle);
+  const [canAutoFollowSubtitles, setCanAutoFollowSubtitles] = React.useState(true);
   const scrollScopeKey = videoInfo.videoId ?? videoInfo.url;
   const scrollScopeRef = React.useRef(scrollScopeKey);
+
+  activeLearningTabRef.current = activeLearningTab;
+  selectedSubtitleRef.current = selectedSubtitle;
 
   React.useLayoutEffect(() => {
     const scrollContainer = scrollContainerRef.current;
@@ -2896,8 +2908,55 @@ function LearningView({
       scrollScopeRef.current = scrollScopeKey;
     }
 
+    if (activeLearningTab === "subtitles") {
+      markSubtitleProgrammaticScroll();
+    }
+
     scrollContainer.scrollTop = tabScrollPositionsRef.current[activeLearningTab] ?? 0;
   }, [activeLearningTab, scrollScopeKey]);
+
+  React.useEffect(() => {
+    return () => {
+      clearSubtitleAutoFollowTimer();
+      clearSubtitleProgrammaticScrollGuard();
+    };
+  }, []);
+
+  React.useEffect(() => {
+    if (activeLearningTab !== "subtitles") {
+      clearSubtitleAutoFollowTimer();
+      subtitlePointerActiveRef.current = false;
+      setCanAutoFollowSubtitles(true);
+      return;
+    }
+
+    if (selectedSubtitle) {
+      clearSubtitleAutoFollowTimer();
+      setCanAutoFollowSubtitles(false);
+      return;
+    }
+
+    scheduleSubtitleAutoFollowResume();
+  }, [activeLearningTab, selectedSubtitle]);
+
+  React.useEffect(() => {
+    function handlePointerEnd() {
+      if (!subtitlePointerActiveRef.current) {
+        return;
+      }
+
+      subtitlePointerActiveRef.current = false;
+      scheduleSubtitleAutoFollowResume();
+    }
+
+    window.addEventListener("pointerup", handlePointerEnd);
+    window.addEventListener("pointercancel", handlePointerEnd);
+
+    return () => {
+      window.removeEventListener("pointerup", handlePointerEnd);
+      window.removeEventListener("pointercancel", handlePointerEnd);
+    };
+  }, []);
 
   function handleSelectLearningTab(tabKey: LearningTabKey) {
     const scrollContainer = scrollContainerRef.current;
@@ -2911,6 +2970,93 @@ function LearningView({
 
   function handleLearningTabScroll(event: React.UIEvent<HTMLElement>) {
     tabScrollPositionsRef.current[activeLearningTab] = event.currentTarget.scrollTop;
+
+    if (activeLearningTab !== "subtitles" || subtitleProgrammaticScrollRef.current) {
+      return;
+    }
+
+    pauseSubtitleAutoFollow();
+    scheduleSubtitleAutoFollowResume();
+  }
+
+  function handleLearningTabPointerDown() {
+    if (activeLearningTabRef.current !== "subtitles") {
+      return;
+    }
+
+    subtitlePointerActiveRef.current = true;
+    pauseSubtitleAutoFollow();
+  }
+
+  function handleLearningTabPointerEnd() {
+    if (!subtitlePointerActiveRef.current) {
+      return;
+    }
+
+    subtitlePointerActiveRef.current = false;
+    scheduleSubtitleAutoFollowResume();
+  }
+
+  function handleSelectSubtitle(selection: SelectedSubtitle) {
+    clearSubtitleAutoFollowTimer();
+    setCanAutoFollowSubtitles(false);
+    onSelectSubtitle(selection);
+  }
+
+  function pauseSubtitleAutoFollow() {
+    clearSubtitleAutoFollowTimer();
+    setCanAutoFollowSubtitles((currentValue) => (currentValue ? false : currentValue));
+  }
+
+  function scheduleSubtitleAutoFollowResume() {
+    clearSubtitleAutoFollowTimer();
+
+    if (activeLearningTabRef.current !== "subtitles" || shouldKeepSubtitleAutoFollowPaused()) {
+      return;
+    }
+
+    subtitleAutoFollowTimerRef.current = window.setTimeout(() => {
+      subtitleAutoFollowTimerRef.current = null;
+
+      if (!shouldKeepSubtitleAutoFollowPaused()) {
+        setCanAutoFollowSubtitles(true);
+      }
+    }, SUBTITLE_AUTO_FOLLOW_IDLE_MS);
+  }
+
+  function shouldKeepSubtitleAutoFollowPaused() {
+    return (
+      subtitlePointerActiveRef.current ||
+      Boolean(selectedSubtitleRef.current) ||
+      Boolean(window.getSelection()?.toString().trim())
+    );
+  }
+
+  function clearSubtitleAutoFollowTimer() {
+    if (subtitleAutoFollowTimerRef.current === null) {
+      return;
+    }
+
+    window.clearTimeout(subtitleAutoFollowTimerRef.current);
+    subtitleAutoFollowTimerRef.current = null;
+  }
+
+  function markSubtitleProgrammaticScroll() {
+    clearSubtitleProgrammaticScrollGuard();
+    subtitleProgrammaticScrollRef.current = true;
+    subtitleProgrammaticScrollTimeoutRef.current = window.setTimeout(() => {
+      subtitleProgrammaticScrollRef.current = false;
+      subtitleProgrammaticScrollTimeoutRef.current = null;
+    }, PROGRAMMATIC_SCROLL_GUARD_MS);
+  }
+
+  function clearSubtitleProgrammaticScrollGuard() {
+    if (subtitleProgrammaticScrollTimeoutRef.current !== null) {
+      window.clearTimeout(subtitleProgrammaticScrollTimeoutRef.current);
+      subtitleProgrammaticScrollTimeoutRef.current = null;
+    }
+
+    subtitleProgrammaticScrollRef.current = false;
   }
 
   return (
@@ -2938,6 +3084,9 @@ function LearningView({
         ref={scrollContainerRef}
         className="min-h-0 flex-1 overflow-y-auto rounded-lg border border-[#dfe4dc] bg-white/70 p-4 shadow-sm"
         onScroll={handleLearningTabScroll}
+        onPointerDown={handleLearningTabPointerDown}
+        onPointerUp={handleLearningTabPointerEnd}
+        onPointerCancel={handleLearningTabPointerEnd}
       >
         <LearningTabContent
           activeLearningTab={activeLearningTab}
@@ -2955,10 +3104,12 @@ function LearningView({
           mockNoteItems={mockNoteItems}
           mockVocabularyItems={mockVocabularyItems}
           shouldPreserveInitialScroll={tabScrollPositionsRef.current[activeLearningTab] !== undefined}
+          canAutoFollowSubtitles={canAutoFollowSubtitles}
           onChatDraftChange={onChatDraftChange}
           onSendChatDraft={onSendChatDraft}
           onSeekToTime={onSeekToTime}
-          onSelectSubtitle={onSelectSubtitle}
+          onSelectSubtitle={handleSelectSubtitle}
+          onSubtitleAutoScrollStart={markSubtitleProgrammaticScroll}
           onStartParsing={onStartParsing}
           onContinueParsing={onContinueParsing}
           onGenerateMoreVocabularyExamples={onGenerateMoreVocabularyExamples}
@@ -2998,10 +3149,12 @@ function LearningTabContent({
   mockNoteItems,
   mockVocabularyItems,
   shouldPreserveInitialScroll,
+  canAutoFollowSubtitles,
   onChatDraftChange,
   onSendChatDraft,
   onSeekToTime,
   onSelectSubtitle,
+  onSubtitleAutoScrollStart,
   onStartParsing,
   onContinueParsing,
   onGenerateMoreVocabularyExamples,
@@ -3025,10 +3178,12 @@ function LearningTabContent({
   mockNoteItems: MockNoteItem[];
   mockVocabularyItems: MockVocabularyItem[];
   shouldPreserveInitialScroll: boolean;
+  canAutoFollowSubtitles: boolean;
   onChatDraftChange: (draft: string) => void;
   onSendChatDraft: () => void | Promise<void>;
   onSeekToTime: (timeSeconds: number) => void;
   onSelectSubtitle: (selection: SelectedSubtitle) => void;
+  onSubtitleAutoScrollStart: () => void;
   onStartParsing: (videoInfo: VideoInfo) => void | Promise<void>;
   onContinueParsing: (videoInfo: VideoInfo) => void | Promise<void>;
   onGenerateMoreVocabularyExamples: (vocabularyItemId: string) => void;
@@ -3067,8 +3222,10 @@ function LearningTabContent({
         source={subtitleSource}
         currentPlaybackTime={currentPlaybackTime}
         shouldPreserveInitialScroll={shouldPreserveInitialScroll}
+        canAutoFollowSubtitles={canAutoFollowSubtitles}
         onSeekToTime={onSeekToTime}
         onSelectSubtitle={onSelectSubtitle}
+        onSubtitleAutoScrollStart={onSubtitleAutoScrollStart}
       />
     );
   }
@@ -3186,15 +3343,19 @@ function SubtitlesContent({
   source,
   currentPlaybackTime,
   shouldPreserveInitialScroll,
+  canAutoFollowSubtitles,
   onSeekToTime,
-  onSelectSubtitle
+  onSelectSubtitle,
+  onSubtitleAutoScrollStart
 }: {
   subtitleSegments: SubtitleSegment[];
   source: GenerationSource;
   currentPlaybackTime: number | null;
   shouldPreserveInitialScroll: boolean;
+  canAutoFollowSubtitles: boolean;
   onSeekToTime: (timeSeconds: number) => void;
   onSelectSubtitle: (selection: SelectedSubtitle) => void;
+  onSubtitleAutoScrollStart: () => void;
 }) {
   const activeSubtitleIndex = findActiveSubtitleIndex(subtitleSegments, currentPlaybackTime);
   const subtitleRefs = React.useRef<Record<number, HTMLElement | null>>({});
@@ -3209,15 +3370,16 @@ function SubtitlesContent({
       }
     }
 
-    if (activeSubtitleIndex < 0) {
+    if (!canAutoFollowSubtitles || activeSubtitleIndex < 0) {
       return;
     }
 
+    onSubtitleAutoScrollStart();
     subtitleRefs.current[activeSubtitleIndex]?.scrollIntoView({
       block: "center",
       behavior: "auto"
     });
-  }, [activeSubtitleIndex, shouldPreserveInitialScroll]);
+  }, [activeSubtitleIndex, canAutoFollowSubtitles, shouldPreserveInitialScroll]);
 
   function handleSubtitleMouseUp(segment: SubtitleSegment) {
     const selection = window.getSelection();
